@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use trailhound_engine::{now_rfc3339, Index, SearchQuery, Settings};
+use trailhound_engine::{now_rfc3339, rfc3339_nanos, Index, SearchQuery, Settings};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::fs::File;
@@ -156,25 +156,30 @@ async fn delete_index(State(p): P, auth: Auth, Path(uid): Path<String>) -> R {
 
 async fn index_stats(auth: Auth, Path(uid): Path<String>) -> R {
     auth.check("stats.get", Some(&uid))?;
-    let s = auth.tenant.require_index(&uid)?.stats();
-    ok(json!({ "numberOfDocuments": s.number_of_documents, "isIndexing": false, "fieldDistribution": s.field_distribution, "rawDocumentDbSize": s.disk_bytes, "segments": s.segments }))
+    let ix = auth.tenant.require_index(&uid)?;
+    let (s, fields) = blocking(move || Ok((ix.stats(), ix.field_distribution()?))).await?;
+    ok(json!({ "numberOfDocuments": s.number_of_documents, "isIndexing": false, "fieldDistribution": fields, "rawDocumentDbSize": s.disk_bytes, "segments": s.segments }))
 }
 
 async fn stats(auth: Auth) -> R {
     auth.check("stats.get", None)?;
-    let mut indexes = Map::new();
-    let mut size = 0;
-    let mut last: Option<String> = None;
-    for (uid, ix) in auth.tenant.indexes.read().unwrap().iter().filter(|(uid, _)| auth.allows_index(uid)) {
-        let s = ix.stats();
-        size += s.disk_bytes;
-        let updated = ix.snapshot().manifest.updated_at.clone();
-        if last.as_ref().is_none_or(|l| *l < updated) {
-            last = Some(updated);
+    let visible: Vec<(String, Arc<Index>)> = auth.tenant.indexes.read().unwrap().iter().filter(|(uid, _)| auth.allows_index(uid)).map(|(uid, ix)| (uid.clone(), ix.clone())).collect();
+    blocking(move || {
+        let mut indexes = Map::new();
+        let mut size = 0;
+        let mut last: Option<String> = None;
+        for (uid, ix) in visible {
+            let s = ix.stats();
+            size += s.disk_bytes;
+            let updated = ix.snapshot().manifest.updated_at.clone();
+            if last.as_ref().is_none_or(|l| *l < updated) {
+                last = Some(updated);
+            }
+            indexes.insert(uid, json!({ "numberOfDocuments": s.number_of_documents, "isIndexing": false, "fieldDistribution": ix.field_distribution()? }));
         }
-        indexes.insert(uid.clone(), json!({ "numberOfDocuments": s.number_of_documents, "isIndexing": false, "fieldDistribution": s.field_distribution }));
-    }
-    ok(json!({ "databaseSize": size, "usedDatabaseSize": size, "lastUpdate": last, "indexes": indexes }))
+        Ok(Json(json!({ "databaseSize": size, "usedDatabaseSize": size, "lastUpdate": last, "indexes": indexes })).into_response())
+    })
+    .await
 }
 
 fn pick_fields(doc: Value, fields: Option<&Vec<String>>) -> Value {
@@ -571,20 +576,81 @@ async fn reset_setting(State(p): P, auth: Auth, Path((uid, name)): Path<(String,
     enqueue_settings(&p, &auth, &uid, Value::Object(patch))
 }
 
+/// A comma-separated task filter. `None` when it is absent or holds `*`.
+fn task_filter<T: std::str::FromStr>(params: &HashMap<String, String>, name: &str) -> Result<Option<Vec<T>>, ApiError> {
+    let Some(raw) = params.get(name) else { return Ok(None) };
+    let mut out = Vec::new();
+    for item in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if item == "*" {
+            return Ok(None);
+        }
+        out.push(item.parse().map_err(|_| ApiError::bad("bad_request", format!("Invalid value in parameter `{name}`: `{item}`.")))?);
+    }
+    Ok(Some(out))
+}
+
+const DAY_NANOS: i128 = 86_400_000_000_000;
+
+/// A task date field with its lower and upper bound, both exclusive.
+type DateBounds = (&'static str, Option<i128>, Option<i128>);
+
+/// The `before…`/`after…` date filters of a task listing.
+fn task_dates(params: &HashMap<String, String>) -> Result<Vec<DateBounds>, ApiError> {
+    let mut out = Vec::new();
+    for field in ["EnqueuedAt", "StartedAt", "FinishedAt"] {
+        let bound = |prefix: &str| -> Result<Option<i128>, ApiError> {
+            let name = format!("{prefix}{field}");
+            let Some(raw) = params.get(&name) else { return Ok(None) };
+            let at = rfc3339_nanos(raw).ok_or_else(|| ApiError::bad("bad_request", format!("Invalid value in parameter `{name}`: `{raw}` is not an RFC 3339 date.")))?;
+            // `after` a day given without a time means after that whole day.
+            Ok(Some(if prefix == "after" && raw.trim().len() == 10 { at + DAY_NANOS - 1 } else { at }))
+        };
+        let (after, before) = (bound("after")?, bound("before")?);
+        if after.is_some() || before.is_some() {
+            out.push((field, after, before));
+        }
+    }
+    Ok(out)
+}
+
 async fn list_tasks(auth: Auth, Query(params): Params) -> R {
     auth.check("tasks.get", None)?;
     let limit = num(&params, "limit", 20)?;
-    let from = params.get("from").and_then(|v| v.parse::<u64>().ok());
-    let list = |name: &str| params.get(name).map(|v| v.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>());
-    let (statuses, types, uids) = (list("statuses"), list("types"), list("indexUids"));
+    let from = match params.get("from") {
+        None => None,
+        Some(_) => Some(num(&params, "from", 0)? as u64),
+    };
+    let reverse = params.get("reverse").is_some_and(|v| v == "true");
+    let statuses = task_filter::<String>(&params, "statuses")?;
+    let types = task_filter::<String>(&params, "types")?;
+    let index_uids = task_filter::<String>(&params, "indexUids")?;
+    let uids = task_filter::<u64>(&params, "uids")?;
+    // Tasks cannot be canceled, so none was canceled by any task.
+    let canceled_by = task_filter::<u64>(&params, "canceledBy")?;
+    let dates = task_dates(&params)?;
     let store = auth.tenant.tasks.lock().unwrap();
-    let mut matching = store.tasks.values().rev().filter(|t| {
-        from.is_none_or(|f| t.uid <= f)
+    let wanted = |t: &&crate::platform::Task| {
+        let in_dates = || {
+            dates.iter().all(|(field, after, before)| {
+                let at = match *field {
+                    "EnqueuedAt" => Some(&t.enqueued_at),
+                    "StartedAt" => t.started_at.as_ref(),
+                    _ => t.finished_at.as_ref(),
+                };
+                at.and_then(|s| rfc3339_nanos(s)).is_some_and(|at| after.is_none_or(|a| at > a) && before.is_none_or(|b| at < b))
+            })
+        };
+        from.is_none_or(|f| if reverse { t.uid >= f } else { t.uid <= f })
+            && canceled_by.is_none()
+            && uids.as_ref().is_none_or(|s| s.contains(&t.uid))
             && statuses.as_ref().is_none_or(|s| s.contains(&t.status))
             && types.as_ref().is_none_or(|s| s.iter().any(|x| x == t.kind.type_name()))
-            && uids.as_ref().is_none_or(|s| t.index_uid.as_ref().is_some_and(|u| s.contains(u)))
+            && index_uids.as_ref().is_none_or(|s| t.index_uid.as_ref().is_some_and(|u| s.contains(u)))
             && t.index_uid.as_ref().is_none_or(|u| auth.allows_index(u))
-    });
+            && in_dates()
+    };
+    // Newest first, or oldest first with `reverse=true`.
+    let mut matching: Box<dyn Iterator<Item = &crate::platform::Task>> = if reverse { Box::new(store.tasks.values().filter(wanted)) } else { Box::new(store.tasks.values().rev().filter(wanted)) };
     let results: Vec<Value> = matching.by_ref().take(limit).map(|t| t.view()).collect();
     let next = matching.next().map(|t| t.uid);
     // `total` counts every task matching the filters, not only this page.

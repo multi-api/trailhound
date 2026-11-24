@@ -1438,6 +1438,29 @@ impl Segment {
         Ok(())
     }
 
+    /// For each field, how many of the documents in `docs` hold it.
+    pub fn field_counts_of(&self, docs: &RoaringBitmap, schema: &Schema) -> Result<BTreeMap<u16, u32>> {
+        let mut counts: BTreeMap<u16, u32> = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        let mut count = |bytes: &[u8]| -> Result<()> {
+            mark_fields(schema, "", &serde_json::from_slice(bytes)?, &mut seen);
+            for fid in std::mem::take(&mut seen) {
+                *counts.entry(fid).or_insert(0) += 1;
+            }
+            Ok(())
+        };
+        // Reading a few documents one by one is cheaper than walking every
+        // block; past that, one pass over the segment is.
+        if docs.len() * 8 < self.doc_count as u64 {
+            for d in docs {
+                count(&self.doc_bytes(d)?)?;
+            }
+        } else {
+            self.for_each_doc(|docid, bytes| if docs.contains(docid) { count(bytes) } else { Ok(()) })?;
+        }
+        Ok(counts)
+    }
+
     pub fn pk_lookup(&self, pk: &str) -> Option<u32> {
         self.pks.get(pk.as_bytes()).map(|v| v as u32)
     }

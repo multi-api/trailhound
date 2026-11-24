@@ -16,7 +16,7 @@ Trailhound gives you typo-tolerant, filterable, sortable full-text search over J
 
 Trailhound is an independent implementation and is not affiliated with Meilisearch.
 
-> **Status: 0.1.** The API listed under [API compatibility](#api-compatibility) is tested against the official JavaScript SDK on every commit. Several Meilisearch features are not implemented and the on-disk format may still change between minor versions; read [What is missing](#what-is-missing) and [Running in production](#running-in-production) before you depend on it.
+> **Status: 0.1.** The API listed under [API compatibility](#api-compatibility) is tested against the official JavaScript, Python, Go and PHP SDKs and against Laravel Scout on every commit. Several Meilisearch features are not implemented and the on-disk format may still change between minor versions; read [What is missing](#what-is-missing) and [Running in production](#running-in-production) before you depend on it.
 
 ## Contents
 
@@ -145,7 +145,55 @@ await client.index('books').addDocuments(books, { primaryKey: 'id' })
 const { hits } = await client.index('books').search('garsia marques', { filter: 'year > 1950' })
 ```
 
-`tests/sdk/compat.mjs` runs 34 checks with `meilisearch-js` 0.63.0 on every commit. Other SDKs use the same HTTP API but are not tested here.
+These clients are run against the server on every commit. Each suite covers the index lifecycle, adding, updating and deleting documents, waiting for tasks, search (typos, filters, sort, facets, pagination, highlighting), settings, keys and multi-search:
+
+| Client | Version tested | Suite |
+| --- | --- | --- |
+| JavaScript: [`meilisearch`](https://github.com/meilisearch/meilisearch-js) | 0.63.0 | `tests/sdk` |
+| Python: [`meilisearch`](https://github.com/meilisearch/meilisearch-python) | 0.43.0 | `tests/sdk-python` |
+| Go: [`meilisearch-go`](https://github.com/meilisearch/meilisearch-go) | 0.37.0 | `tests/sdk-go` |
+| PHP: [`meilisearch/meilisearch-php`](https://github.com/meilisearch/meilisearch-php) | 1.17.0 | `tests/sdk-php` |
+| Laravel: [`laravel/scout`](https://laravel.com/docs/scout) with its Meilisearch driver | Scout 11.11.0 on Laravel 13.44.1 | `tests/sdk-laravel` |
+
+In each suite, the calls that need a feature listed under [What is missing](#what-is-missing) are marked as expected failures, with the reason. Other SDKs use the same HTTP API but are not tested here.
+
+### Laravel Scout
+
+Scout's Meilisearch driver works unchanged. Install it as the Scout documentation says:
+
+```sh
+composer require laravel/scout meilisearch/meilisearch-php http-interop/http-factory-guzzle
+php artisan vendor:publish --provider="Laravel\Scout\ScoutServiceProvider"
+```
+
+Point it at Trailhound in `.env`, with a tenant key:
+
+```ini
+SCOUT_DRIVER=meilisearch
+MEILISEARCH_HOST=http://127.0.0.1:7700
+MEILISEARCH_KEY=your-tenant-master-key
+```
+
+As with Meilisearch, the attributes used by `where` and `orderBy` have to be declared, in `config/scout.php`, and sent to the server with `php artisan scout:sync-index-settings`:
+
+```php
+'meilisearch' => [
+    'host' => env('MEILISEARCH_HOST', 'http://localhost:7700'),
+    'key' => env('MEILISEARCH_KEY'),
+    'index-settings' => [
+        Book::class => [
+            'filterableAttributes' => ['author', 'year'],
+            'sortableAttributes' => ['year'],
+        ],
+    ],
+],
+```
+
+```php
+Book::search('garsia marques')->where('year', '>', 1950)->orderBy('year')->paginate(20);
+```
+
+`tests/sdk-laravel` is a minimal Laravel application that checks indexing on save, `search`, `where`, `whereIn`, `whereNotIn`, `orderBy`, `paginate`, and the `scout:index`, `scout:sync-index-settings`, `scout:import`, `scout:flush` and `scout:delete-index` commands.
 
 ## Running in production
 
@@ -328,7 +376,7 @@ Implemented, following the Meilisearch API:
 | Documents | JSON and NDJSON; add or replace, partial update, get, fetch, delete by id, by batch and by filter |
 | Search | `q`, typo tolerance, prefix search, phrase search with quotes, `filter`, `sort`, `facets`, `limit`/`offset` and `page`/`hitsPerPage`, highlighting, cropping, `matchingStrategy`, `attributesToSearchOn`, `attributesToRetrieve`, `showMatchesPosition`; `POST /multi-search` |
 | Settings | The settings object and its sub-routes: searchable, filterable, sortable and displayed attributes, ranking rules, stop words, synonyms, typo tolerance, faceting, pagination |
-| Tasks | List and get, with the Meilisearch task shape |
+| Tasks | List and get, with the Meilisearch task shape; filter by `uids`, `indexUids`, `statuses`, `types` and the `before…`/`after…` dates, newest first or `reverse` |
 | Keys | Create, list, get, update, delete, with actions and indexes |
 | Other | `health`, `version`, `stats` |
 
@@ -345,6 +393,7 @@ Not implemented:
 - `distinctAttribute`, geosearch, CSV uploads, federated search, tenant tokens (JWT), index swaps.
 - Vector and hybrid search.
 - Dumps and snapshots, and task cancellation and deletion.
+- Batches (`GET /batches`). Every task reports its own uid as its `batchUid`.
 - TLS, request rate limiting and access logs. Use a reverse proxy.
 - Encryption of keys at rest: API keys are stored in clear text in the data folder.
 - Replication and clustering: a server is a single node.
@@ -355,7 +404,7 @@ Known differences and rough edges:
 - With many ties, tied documents come out in a different order than in Meilisearch.
 - A search keeps running on the server after its client disconnects.
 - The `proximity` and `wordPosition` rules are skipped for groups of more than 100,000 tied candidates.
-- `fieldDistribution` also counts deleted documents that have not been through a merge yet.
+- The `distinctAttribute` setting and the `distinct` search parameter are accepted and stored, but not applied: no error is returned.
 - When merging, the sort columns of the resulting segment are built in memory (8 bytes per document and numeric field; one string per document for text fields).
 - Opening a segment verifies the checksum of all its sections, which reads the whole file on start.
 
@@ -450,12 +499,19 @@ cargo build --release
 cargo test --release                 # engine tests
 ```
 
-SDK compatibility test, against a running server:
+SDK compatibility tests, against a running server. Each suite is independent; run the ones whose toolchain you have:
 
 ```sh
 target/release/trailhound --data-dir ./data-test --addr 127.0.0.1:7711 --master-key test-master-key
-cd tests/sdk && npm install && npm test
+
+cd tests/sdk && npm install && npm test                                    # JavaScript
+cd tests/sdk-python && pip install -r requirements.txt && python compat.py # Python
+cd tests/sdk-go && go run .                                                # Go
+cd tests/sdk-php && composer install && php compat.php                     # PHP
+cd tests/sdk-laravel && composer install && cp .env.example .env && php compat.php   # Laravel Scout
 ```
+
+The suites read the server's address from `TRAILHOUND_URL` (`MEILISEARCH_HOST` for the Laravel application) when it is not `http://127.0.0.1:7711`.
 
 The admin panel is a React, Tailwind and shadcn/ui application in `panel/`. It builds into a single HTML file at `crates/server/src/panel.html`, which is committed and embedded in the binary, so `cargo build` does not need Node:
 

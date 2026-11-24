@@ -242,7 +242,9 @@ If a change trades memory for speed, measure both with `tests/bench/multitenant.
 
 - `crates/engine/tests/basic.rs`: the engine through its public API, including round trips, merges compared against a freshly built index, range filters compared against a full scan, and the typo automaton compared against plain edit distance.
 - `tests/sdk/compat.mjs`: the HTTP API through the official JavaScript SDK, against a running server.
+- `tests/sdk-python`, `tests/sdk-go`, `tests/sdk-php`: the same checks through the official Python, Go and PHP clients.
+- `tests/sdk-laravel`: a minimal Laravel application that uses the server through Laravel Scout's Meilisearch driver.
 - `tests/bench/ranking.sh`: result order compared with a real Meilisearch, query by query.
 - `tests/bench/bench.sh` and `multitenant.sh`: memory, disk, indexing time and query latency, next to Meilisearch.
 
-CI (`.github/workflows/ci.yml`) builds and runs the engine tests on Linux (x86-64 and ARM64), macOS and Windows, runs clippy, the SDK test, the panel build and the Docker build.
+CI (`.github/workflows/ci.yml`) builds and runs the engine tests on Linux (x86-64 and ARM64), macOS and Windows, runs clippy, the SDK tests, the panel build and the Docker build.

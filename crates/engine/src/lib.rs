@@ -18,4 +18,4 @@ pub use error::{Error, Result};
 pub use index::{configure_indexing, Index, IndexStats};
 pub use search::SearchQuery;
 pub use settings::Settings;
-pub use util::{atomic_write, now_rfc3339};
+pub use util::{atomic_write, now_rfc3339, rfc3339_nanos};

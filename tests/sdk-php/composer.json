@@ -1,0 +1,19 @@
+{
+    "name": "trailhound/sdk-php-compat",
+    "description": "Drives a running Trailhound server through the official meilisearch-php client.",
+    "license": "MIT",
+    "require": {
+        "php": "^8.2",
+        "meilisearch/meilisearch-php": "1.17.0",
+        "guzzlehttp/guzzle": "7.17.0",
+        "http-interop/http-factory-guzzle": "1.2.1"
+    },
+    "scripts": {
+        "test": "@php compat.php"
+    },
+    "config": {
+        "allow-plugins": {
+            "php-http/discovery": true
+        }
+    }
+}

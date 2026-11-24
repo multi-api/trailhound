@@ -16,14 +16,14 @@ People arrive with an application that already talks to Meilisearch. The fewer t
 
 ### Client libraries
 
-The HTTP API is the same for every SDK, but each SDK exercises it differently (routes, query parameters, how it waits for tasks, which fields it expects in answers). Today only the JavaScript SDK is tested.
+The HTTP API is the same for every SDK, but each SDK exercises it differently (routes, query parameters, how it waits for tasks, which fields it expects in answers). The clients below are run against the server on every commit; the versions are in the README.
 
 | Item | What and why | Status |
 | --- | --- | --- |
 | JavaScript | 34 checks with the official `meilisearch-js` in `tests/sdk`, run on every commit. | Done |
-| [PHP and Laravel Scout](https://github.com/multi-api/trailhound/issues/3) | A test suite with `meilisearch-php` and one with Scout's Meilisearch driver. Laravel is where a large share of small Meilisearch deployments live, and they are the ones a low-memory server suits best. | Not started |
-| [Python](https://github.com/multi-api/trailhound/issues/2) | The same with the official `meilisearch` Python package. | Not started |
-| [Go](https://github.com/multi-api/trailhound/issues/4) | The same with `meilisearch-go`. | Not started |
+| [PHP and Laravel Scout](https://github.com/multi-api/trailhound/issues/3) | A test suite with `meilisearch-php` in `tests/sdk-php` and one with Scout's Meilisearch driver, from a minimal Laravel application, in `tests/sdk-laravel`. Laravel is where a large share of small Meilisearch deployments live, and they are the ones a low-memory server suits best. | Done |
+| [Python](https://github.com/multi-api/trailhound/issues/2) | The same with the official `meilisearch` Python package, in `tests/sdk-python`. | Done |
+| [Go](https://github.com/multi-api/trailhound/issues/4) | The same with `meilisearch-go`, in `tests/sdk-go`. | Done |
 
 ### Meilisearch features that are missing
 

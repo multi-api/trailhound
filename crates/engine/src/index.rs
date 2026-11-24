@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock, Weak};
 
 const MAX_SEGMENT_DOCS: u32 = 200_000;
 const MAX_SEGMENT_RAW_BYTES: u64 = 128 * 1024 * 1024;
@@ -115,15 +115,19 @@ pub struct State {
 #[serde(rename_all = "camelCase")]
 pub struct IndexStats {
     pub number_of_documents: u64,
-    pub field_distribution: BTreeMap<String, u64>,
     pub disk_bytes: u64,
     pub segments: usize,
 }
+
+/// A field distribution and the snapshot it was computed from.
+type Distribution = (Weak<State>, BTreeMap<String, u64>);
 
 pub struct Index {
     dir: PathBuf,
     state: RwLock<Arc<State>>,
     wlock: Mutex<()>,
+    /// The field distribution of one snapshot, kept until the index changes.
+    distribution: Mutex<Option<Distribution>>,
 }
 
 fn seg_path(dir: &Path, id: u64) -> PathBuf {
@@ -323,7 +327,7 @@ impl Index {
             }
         }
         let schema = Schema::new(manifest.fields.clone(), &manifest.settings);
-        Ok(Index { dir: dir.to_path_buf(), state: RwLock::new(Arc::new(State { manifest, segs, schema })), wlock: Mutex::new(()) })
+        Ok(Index { dir: dir.to_path_buf(), state: RwLock::new(Arc::new(State { manifest, segs, schema })), wlock: Mutex::new(()), distribution: Mutex::new(None) })
     }
 
     pub fn snapshot(&self) -> Arc<State> {
@@ -719,20 +723,37 @@ impl Index {
 
     pub fn stats(&self) -> IndexStats {
         let st = self.snapshot();
-        let mut dist: BTreeMap<String, u64> = BTreeMap::new();
-        for s in &st.segs {
-            for (fid, n) in &s.seg.field_counts {
-                if let Some(name) = st.schema.fields.get(*fid as usize) {
-                    *dist.entry(name.clone()).or_insert(0) += *n as u64;
-                }
-            }
-        }
         IndexStats {
             number_of_documents: st.segs.iter().map(|s| s.live_count()).sum(),
-            field_distribution: dist,
             disk_bytes: st.segs.iter().map(|s| s.seg.file_size).sum(),
             segments: st.segs.len(),
         }
+    }
+
+    /// How many documents hold each field. Deleted and replaced documents
+    /// are not counted, although they stay in their segment until a merge.
+    pub fn field_distribution(&self) -> Result<BTreeMap<String, u64>> {
+        let st = self.snapshot();
+        if let Some((of, dist)) = self.distribution.lock().unwrap().as_ref() {
+            if of.upgrade().is_some_and(|s| Arc::ptr_eq(&s, &st)) {
+                return Ok(dist.clone());
+            }
+        }
+        let mut counts: BTreeMap<u16, u64> = BTreeMap::new();
+        for s in &st.segs {
+            for (fid, n) in &s.seg.field_counts {
+                *counts.entry(*fid).or_insert(0) += *n as u64;
+            }
+            if !s.deleted.is_empty() {
+                for (fid, n) in s.seg.field_counts_of(&s.deleted, &st.schema)? {
+                    let c = counts.entry(fid).or_insert(0);
+                    *c = c.saturating_sub(n as u64);
+                }
+            }
+        }
+        let dist: BTreeMap<String, u64> = counts.into_iter().filter(|(_, n)| *n > 0).filter_map(|(fid, n)| st.schema.fields.get(fid as usize).map(|name| (name.clone(), n))).collect();
+        *self.distribution.lock().unwrap() = Some((Arc::downgrade(&st), dist.clone()));
+        Ok(dist)
     }
 
     pub fn search(&self, q: &crate::SearchQuery) -> Result<Value> {

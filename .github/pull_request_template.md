@@ -12,7 +12,7 @@
 
 - [ ] `cargo test --release` passes, and `cargo clippy --all-targets -- -D warnings` is clean.
 - [ ] A test was added or updated for the bug fixed or the behaviour added.
-- [ ] If the HTTP API changed: `tests/sdk` still passes against a running server (`npm test`).
+- [ ] If the HTTP API changed: the SDK suites (`tests/sdk*`) still pass against a running server, or CI ran them.
 
 Only where they apply; delete the rest:
 
