@@ -62,6 +62,9 @@ async fn serve() {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(CorsLayer::permissive())
         .with_state(platform.clone());
+    // `/tasks/` is `/tasks`: Meilisearch answers both, and some of its
+    // clients (meilisearch-php among them) ask for the first.
+    let app = tower_http::normalize_path::NormalizePath::trim_trailing_slash(app);
 
     tokio::spawn(async {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -121,6 +124,7 @@ async fn serve() {
         }
         println!("[trailhound] shutting down");
     };
+    let app = axum::ServiceExt::<axum::extract::Request>::into_make_service(app);
     if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(shutdown).await {
         eprintln!("[trailhound] server error: {e}");
     }

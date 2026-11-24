@@ -303,9 +303,9 @@ fn nested_fields_survive_parallel_indexing() {
         expected.push(format!("extra_{e}.x"));
     }
     expected.sort();
-    assert_eq!(stats.field_distribution.keys().cloned().collect::<Vec<_>>(), expected);
-    assert_eq!(stats.field_distribution["meta.origen.pais"], 6_000);
-    assert_eq!(stats.field_distribution["extra_3.x"], 500);
+    assert_eq!(index.field_distribution().unwrap().keys().cloned().collect::<Vec<_>>(), expected);
+    assert_eq!(index.field_distribution().unwrap()["meta.origen.pais"], 6_000);
+    assert_eq!(index.field_distribution().unwrap()["extra_3.x"], 500);
     let count = |v: Value| index.search(&q(v)).unwrap()["estimatedTotalHits"].as_u64().unwrap();
     assert_eq!(count(json!({"filter": "meta.origen.pais = ar"})), 2_000);
     assert_eq!(count(json!({"filter": "tags.k = a AND meta.peso < 15"})), 10);
@@ -430,4 +430,53 @@ fn deeply_nested_filters_are_refused() {
     assert!(parse_str(&format!("{}a = 1{}", "(".repeat(20_000), ")".repeat(20_000))).is_err());
     // Width is not depth: a long flat filter is fine.
     assert!(parse_str(&vec!["a = 1"; 5_000].join(" OR ")).is_ok());
+}
+
+#[test]
+fn field_distribution_counts_only_live_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = setup(dir.path());
+    let dist = |index: &Index| index.field_distribution().unwrap();
+    assert_eq!(dist(&index)["title"], 6);
+    assert_eq!(dist(&index)["price"], 1);
+
+    // A deleted document stays in its segment, but is no longer counted.
+    index.delete_documents(&["6".to_string()], 3).unwrap();
+    assert_eq!(index.stats().number_of_documents, 5);
+    assert_eq!(dist(&index)["title"], 5);
+    assert!(!dist(&index).contains_key("price"), "{:?}", dist(&index));
+
+    // A replaced document is counted once, with the fields of its new version.
+    index.add_documents(vec![json!({"id": 1, "title": "Carol", "director": "Todd Haynes"})], None, false, 4).unwrap();
+    assert_eq!(dist(&index)["title"], 5);
+    assert_eq!(dist(&index)["overview"], 4);
+    assert_eq!(dist(&index)["director"], 1);
+
+    // A partial update keeps the fields it does not mention.
+    index.add_documents(vec![json!({"id": 2, "seen": true})], None, true, 5).unwrap();
+    assert_eq!(dist(&index)["title"], 5);
+    assert_eq!(dist(&index)["seen"], 1);
+
+    index.delete_by_filter(&json!("year < 2016"), 6).unwrap();
+    assert_eq!(index.stats().number_of_documents, 3);
+    assert_eq!(dist(&index)["title"], 3);
+
+    // The answer is the same after the index is opened again.
+    let before = dist(&index);
+    drop(index);
+    assert_eq!(dist(&Index::open(dir.path()).unwrap()), before);
+}
+
+#[test]
+fn rfc3339_dates_compare_across_offsets() {
+    use trailhound_engine::rfc3339_nanos as at;
+    assert_eq!(at("1970-01-01T00:00:01Z"), Some(1_000_000_000));
+    assert_eq!(at("2026-01-31T12:00:00+02:00"), at("2026-01-31T10:00:00Z"));
+    assert_eq!(at("2026-01-31 10:00:00Z"), at("2026-01-31T10:00:00Z"));
+    assert_eq!(at("2026-01-31"), at("2026-01-31T00:00:00Z"));
+    assert!(at("2026-01-31T10:00:00.5Z") > at("2026-01-31T10:00:00Z"));
+    assert!(at(&trailhound_engine::now_rfc3339()) > at("2026-01-01"));
+    for bad in ["", "yesterday", "2026-13-01", "2026-01-31T10:00:00"] {
+        assert_eq!(at(bad), None, "{bad}");
+    }
 }

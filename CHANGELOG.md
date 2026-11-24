@@ -2,6 +2,14 @@
 
 All notable changes to Trailhound are recorded here. The project follows [semantic versioning](https://semver.org); before 1.0, minor versions may change the API and the on-disk format.
 
+## Unreleased
+
+Compatibility with the official Meilisearch clients for Python, Go and PHP and with Laravel Scout, each now tested on every commit next to the JavaScript one.
+
+- A path with a trailing slash is the same route as without it. `GET /tasks/` and `GET /keys/`, which is how `meilisearch-php` lists tasks and keys, answered `404`.
+- `fieldDistribution` in the index and global stats counts only live documents. It used to include deleted and replaced documents until their segment was merged.
+- `GET /tasks` accepts the `uids`, `canceledBy`, `reverse`, `beforeEnqueuedAt`, `afterEnqueuedAt`, `beforeStartedAt`, `afterStartedAt`, `beforeFinishedAt` and `afterFinishedAt` parameters, and `*` in the list filters. They were ignored, so a client asking for some tasks got all of them. An invalid `from`, uid or date is now a `400` instead of being ignored.
+
 ## 0.1.0 — 2026-11-24
 
 First public version.

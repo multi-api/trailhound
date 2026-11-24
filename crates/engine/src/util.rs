@@ -114,3 +114,11 @@ pub fn now_rfc3339() -> String {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
 }
+
+/// An RFC 3339 date and time, with any offset, as nanoseconds since the Unix
+/// epoch. A date alone (`2026-01-31`) is the start of that day in UTC.
+pub fn rfc3339_nanos(text: &str) -> Option<i128> {
+    let text = text.trim();
+    let full = if text.len() == 10 { format!("{text}T00:00:00Z") } else { text.replacen(' ', "T", 1) };
+    time::OffsetDateTime::parse(&full, &time::format_description::well_known::Rfc3339).ok().map(|t| t.unix_timestamp_nanos())
+}
