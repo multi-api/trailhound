@@ -3,6 +3,7 @@
 **Search that stays on the trail.** A low-memory, multi-tenant search engine with a Meilisearch-compatible API, written in Rust.
 
 [![CI](https://github.com/multi-api/trailhound/actions/workflows/ci.yml/badge.svg)](https://github.com/multi-api/trailhound/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/trailhound.svg)](https://crates.io/crates/trailhound)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Trailhound gives you typo-tolerant, filterable, sortable full-text search over JSON documents. It speaks the Meilisearch HTTP API, so the official Meilisearch SDKs work against it, and it is built for one thing Meilisearch is not: running many customers on a small machine.
@@ -48,7 +49,14 @@ Or download a binary for Linux (x86-64 and ARM64), macOS (Apple silicon) or Wind
 ./trailhound --data-dir ./data --addr 127.0.0.1:7700
 ```
 
-Or from source, with a stable Rust toolchain:
+Or install it from [crates.io](https://crates.io/crates/trailhound) with a stable Rust toolchain:
+
+```sh
+cargo install trailhound --locked
+trailhound --data-dir ./data --addr 127.0.0.1:7700
+```
+
+Or build from source:
 
 ```sh
 cargo build --release
