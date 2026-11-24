@@ -42,6 +42,12 @@ docker compose up -d --build
 docker exec trailhound cat /data/platform.json     # shows the admin key
 ```
 
+Or download a binary for Linux (x86-64 and ARM64), macOS (Apple silicon) or Windows from the [latest release](https://github.com/multi-api/trailhound/releases/latest), unpack it and run it:
+
+```sh
+./trailhound --data-dir ./data --addr 127.0.0.1:7700
+```
+
 Or from source, with a stable Rust toolchain:
 
 ```sh
