@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: Build and engine tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+
+  sdk:
+    name: SDK compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo build --release --locked
+      - name: Start the server
+        run: |
+          target/release/trailhound --data-dir "$RUNNER_TEMP/data" --addr 127.0.0.1:7711 --master-key test-master-key &
+          for i in $(seq 1 50); do curl -sf http://127.0.0.1:7711/health >/dev/null && exit 0; sleep 0.2; done
+          echo "server did not start" >&2; exit 1
+      - name: Run the meilisearch-js checks
+        working-directory: tests/sdk
+        run: npm ci && npm test
+
+  panel:
+    name: Admin panel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - working-directory: panel
+        run: npm ci && npm run build
+      - name: The committed panel.html matches the sources
+        run: git diff --exit-code -- crates/server/src/panel.html
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t trailhound:ci .
+      - name: The container starts and answers
+        run: |
+          docker run -d --name th -p 127.0.0.1:7700:7700 trailhound:ci
+          for i in $(seq 1 50); do curl -sf http://127.0.0.1:7700/health && exit 0; sleep 0.2; done
+          docker logs th; exit 1
