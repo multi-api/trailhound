@@ -235,6 +235,9 @@ async fn get_document(auth: Auth, Path((uid, id)): Path<(String, String)>, Query
     }
 }
 
+/// Queries one `multi-search` request may carry.
+const MAX_MULTI_SEARCH_QUERIES: usize = 100;
+
 /// Largest accepted document payload.
 const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -252,6 +255,8 @@ async fn write_documents(p: Arc<Platform>, auth: Auth, uid: String, params: Hash
     }
     let primary_key = params.get("primaryKey").cloned();
     let tenant = auth.tenant.clone();
+    // A tenant already over its quota is told before it uploads anything.
+    tenant.check_document_quota(0, 0)?;
     let id = Uuid::new_v4().simple().to_string();
     // The body goes to disk as it arrives and is checked from there, one
     // document at a time: the memory a request needs does not grow with it.
@@ -441,6 +446,8 @@ async fn delete_by_filter(State(p): P, auth: Auth, Path(uid): Path<String>, body
     if filter.is_null() {
         return Err(ApiError::bad("missing_document_filter", "Missing field `filter`."));
     }
+    // Checked now, so a filter that cannot be parsed never reaches the task log.
+    trailhound_engine::filter::parse_value(&filter)?;
     let details = json!({ "providedIds": 0, "deletedDocuments": null, "originalFilter": filter.to_string() });
     accepted(auth.tenant.enqueue(&p, Some(&uid), Kind::DocumentDeletionByFilter { filter }, details)?)
 }
@@ -486,6 +493,9 @@ async fn multi_search(auth: Auth, body: Bytes) -> R {
         return Err(ApiError::bad("feature_not_enabled", "Federated search is not supported yet."));
     }
     let queries = body["queries"].as_array().cloned().ok_or_else(|| ApiError::bad("bad_request", "Missing field `queries`."))?;
+    if queries.len() > MAX_MULTI_SEARCH_QUERIES {
+        return Err(ApiError::bad("bad_request", format!("A multi-search request can hold at most {MAX_MULTI_SEARCH_QUERIES} queries.")));
+    }
     let mut results = Vec::with_capacity(queries.len());
     for q in queries {
         let query = parse_query(q)?;
@@ -585,8 +595,9 @@ async fn list_tasks(auth: Auth, Query(params): Params) -> R {
 async fn get_task(auth: Auth, Path(uid): Path<u64>) -> R {
     auth.check("tasks.get", None)?;
     match auth.tenant.tasks.lock().unwrap().tasks.get(&uid) {
-        Some(t) => ok(t.view()),
-        None => Err(ApiError::not_found("task_not_found", format!("Task `{uid}` not found."))),
+        // A key limited to some indexes sees only their tasks, as in the list.
+        Some(t) if t.index_uid.as_ref().map_or(true, |u| auth.allows_index(u)) => ok(t.view()),
+        _ => Err(ApiError::not_found("task_not_found", format!("Task `{uid}` not found."))),
     }
 }
 
@@ -597,14 +608,34 @@ async fn list_keys(auth: Auth, Query(params): Params) -> R {
     ok(json!({ "results": keys.iter().skip(offset).take(limit).collect::<Vec<_>>(), "offset": offset, "limit": limit, "total": keys.len() }))
 }
 
+/// A key's expiry as `YYYY-MM-DDTHH:MM:SSZ`, the form it is compared in.
+/// Accepts a date, or a date and time separated by `T` or a space, in UTC.
+fn expiry(text: &str) -> Option<String> {
+    let text = text.trim().trim_end_matches('Z');
+    let (date, time) = match text.split_once(|c| c == 'T' || c == ' ') {
+        Some((d, t)) => (d, t.split('.').next().unwrap_or(t)),
+        None => (text, "00:00:00"),
+    };
+    let numbers = |s: &str, sep: char, widths: &[usize], max: &[u32]| {
+        let parts: Vec<&str> = s.split(sep).collect();
+        parts.len() == widths.len()
+            && parts.iter().zip(widths).zip(max).all(|((p, w), m)| p.len() == *w && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u32>().map_or(false, |n| n <= *m))
+    };
+    (numbers(date, '-', &[4, 2, 2], &[9999, 12, 31]) && numbers(time, ':', &[2, 2, 2], &[23, 59, 59])).then(|| format!("{date}T{time}Z"))
+}
+
 async fn create_key(State(p): P, auth: Auth, body: Bytes) -> R {
     auth.check("keys.create", None)?;
     let body = parse_body(&body)?;
     let actions = string_list(&body["actions"]).filter(|a| body["actions"].is_array() && !a.is_empty()).ok_or_else(|| ApiError::bad("missing_api_key_actions", "Missing field `actions`."))?;
     let indexes = string_list(&body["indexes"]).filter(|_| body["indexes"].is_array()).ok_or_else(|| ApiError::bad("missing_api_key_indexes", "Missing field `indexes`."))?;
-    if body.get("expiresAt").is_none() {
-        return Err(ApiError::bad("missing_api_key_expires_at", "Missing field `expiresAt`."));
-    }
+    let expires_at = match body.get("expiresAt") {
+        None => return Err(ApiError::bad("missing_api_key_expires_at", "Missing field `expiresAt`.")),
+        Some(Value::Null) => None,
+        Some(v) => Some(v.as_str().and_then(expiry).ok_or_else(|| {
+            ApiError::bad("invalid_api_key_expires_at", "`expiresAt` must be null or a UTC date such as `2030-01-31` or `2030-01-31T12:00:00Z`.")
+        })?),
+    };
     let now = now_rfc3339();
     let key = ApiKey {
         name: body["name"].as_str().map(|s| s.to_string()),
@@ -613,7 +644,7 @@ async fn create_key(State(p): P, auth: Auth, body: Bytes) -> R {
         uid: body["uid"].as_str().map(|s| s.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()),
         actions,
         indexes,
-        expires_at: body["expiresAt"].as_str().map(|s| s.to_string()),
+        expires_at,
         created_at: now.clone(),
         updated_at: now,
     };

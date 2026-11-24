@@ -10,10 +10,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
+/// The admin key controls every tenant; a short one is refused.
+const MIN_ADMIN_KEY_LEN: usize = 16;
+/// Largest request body outside document uploads, which are streamed to disk
+/// under their own limit. Settings, id lists and searches fit well below it.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 fn setting(flag: &str, envs: &[&str]) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == flag) {
-        if let Some(v) = args.get(i + 1) {
+        // An empty value (`--admin-key "$UNSET"`) is the same as no value.
+        if let Some(v) = args.get(i + 1).filter(|v| !v.is_empty()) {
             return Some(v.clone());
         }
     }
@@ -33,6 +40,10 @@ async fn serve() {
     let addr = setting("--addr", &["TRAILHOUND_ADDR", "MEILI_HTTP_ADDR"]).unwrap_or_else(|| "127.0.0.1:7700".into());
     let admin_key = setting("--admin-key", &["TRAILHOUND_ADMIN_KEY"]);
     let master_key = setting("--master-key", &["TRAILHOUND_MASTER_KEY", "MEILI_MASTER_KEY"]);
+    if admin_key.as_ref().is_some_and(|k| k.len() < MIN_ADMIN_KEY_LEN) {
+        eprintln!("[trailhound] the admin key must be at least {MIN_ADMIN_KEY_LEN} characters long");
+        std::process::exit(1);
+    }
     let number = |flag: &str, env: &str| setting(flag, &[env]).and_then(|v| v.parse::<usize>().ok());
     trailhound_engine::configure_indexing(number("--indexing-threads", "TRAILHOUND_INDEXING_THREADS"), number("--indexing-memory-mb", "TRAILHOUND_INDEXING_MEMORY_MB").map(|mb| mb << 20));
     let generated = admin_key.is_none() && !data_dir.join("platform.json").exists();
@@ -48,7 +59,7 @@ async fn serve() {
     let app = api::router()
         .merge(admin::router())
         .fallback(|| async { error::ApiError::new(StatusCode::NOT_FOUND, "not_found", "The requested resource was not found.") })
-        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(CorsLayer::permissive())
         .with_state(platform.clone());
 

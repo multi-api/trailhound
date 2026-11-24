@@ -418,3 +418,16 @@ fn typo_matching_agrees_with_edit_distance() {
     }
     assert!(checked > 200, "only {checked} queries were checked");
 }
+
+#[test]
+fn deeply_nested_filters_are_refused() {
+    use trailhound_engine::filter::parse_str;
+    // Each level is a stack frame: without a limit a long enough filter
+    // would overflow the stack and abort the process.
+    assert!(parse_str(&format!("{}a = 1", "NOT ".repeat(60))).is_ok());
+    assert!(parse_str(&format!("{}a = 1{}", "(".repeat(60), ")".repeat(60))).is_ok());
+    assert!(parse_str(&format!("{}a = 1", "NOT ".repeat(20_000))).is_err());
+    assert!(parse_str(&format!("{}a = 1{}", "(".repeat(20_000), ")".repeat(20_000))).is_err());
+    // Width is not depth: a long flat filter is fine.
+    assert!(parse_str(&vec!["a = 1"; 5_000].join(" OR ")).is_ok());
+}

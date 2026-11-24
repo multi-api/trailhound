@@ -18,6 +18,10 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use uuid::Uuid;
 
 const KEPT_FINISHED_TASKS: usize = 10_000;
+/// Finished tasks are also dropped, oldest first, past this many bytes.
+const KEPT_FINISHED_BYTES: usize = 32 * 1024 * 1024;
+/// The task log is rewritten once it has grown past this and doubled.
+const LOG_COMPACT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Set when a search ran, so the memory its threads freed is handed back
 /// shortly after instead of staying in the allocator.
@@ -109,6 +113,17 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Drop the request's payload once the task has run: only its summary
+    /// (`details`) is shown afterwards.
+    fn slim(&mut self) {
+        match self {
+            Kind::DocumentDeletion { ids } => *ids = Vec::new(),
+            Kind::DocumentDeletionByFilter { filter } => *filter = Value::Null,
+            Kind::SettingsUpdate { patch } => *patch = Value::Null,
+            _ => {}
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Kind::IndexCreation { .. } => "indexCreation",
@@ -136,6 +151,9 @@ pub struct Task {
     /// Set when the task was interrupted by a crash and is being replayed.
     #[serde(skip)]
     pub retry: bool,
+    /// Bytes this task takes in the log, once finished.
+    #[serde(skip)]
+    size: usize,
 }
 
 impl Task {
@@ -161,7 +179,14 @@ pub struct TaskStore {
     pub tasks: BTreeMap<u64, Task>,
     queue: VecDeque<u64>,
     next: u64,
+    path: PathBuf,
     log: File,
+    /// Finished tasks, oldest first, and the bytes they take.
+    finished: VecDeque<u64>,
+    finished_bytes: usize,
+    /// Size of the log file, and the size at which it is next rewritten.
+    log_bytes: u64,
+    compact_at: u64,
 }
 
 impl TaskStore {
@@ -176,15 +201,9 @@ impl TaskStore {
             }
         }
         let next = tasks.keys().next_back().map_or(0, |u| u + 1);
-        let finished = tasks.values().filter(|t| t.status == "succeeded" || t.status == "failed").count();
-        if finished > KEPT_FINISHED_TASKS {
-            let drop: Vec<u64> = tasks.values().filter(|t| t.status == "succeeded" || t.status == "failed").take(finished - KEPT_FINISHED_TASKS).map(|t| t.uid).collect();
-            for uid in drop {
-                tasks.remove(&uid);
-            }
-        }
         let mut queue = VecDeque::new();
-        let mut compact = Vec::new();
+        let mut finished = VecDeque::new();
+        let mut finished_bytes = 0;
         for task in tasks.values_mut() {
             if task.status == "processing" {
                 task.status = "enqueued".into();
@@ -192,22 +211,66 @@ impl TaskStore {
             }
             if task.status == "enqueued" {
                 queue.push_back(task.uid);
+            } else {
+                task.kind.slim();
+                task.size = serde_json::to_vec(task)?.len();
+                finished.push_back(task.uid);
+                finished_bytes += task.size;
             }
-            compact.extend_from_slice(&serde_json::to_vec(task)?);
-            compact.push(b'\n');
         }
-        atomic_write(path, &compact).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let log = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(TaskStore { tasks, queue, next, log })
+        let mut store = TaskStore { tasks, queue, next, path: path.to_path_buf(), log, finished, finished_bytes, log_bytes: 0, compact_at: 0 };
+        store.prune();
+        store.compact()?;
+        Ok(store)
     }
 
-    fn append(&mut self, task: &Task, sync: bool) -> std::io::Result<()> {
+    fn append(&mut self, task: &Task, sync: bool) -> std::io::Result<usize> {
         let mut line = serde_json::to_vec(task)?;
         line.push(b'\n');
         self.log.write_all(&line)?;
         if sync {
             self.log.sync_data()?;
         }
+        self.log_bytes += line.len() as u64;
+        Ok(line.len())
+    }
+
+    /// Record a task's outcome, then keep the history and the log bounded.
+    fn finish(&mut self, mut task: Task) {
+        task.size = self.append(&task, true).unwrap_or(0);
+        self.finished.push_back(task.uid);
+        self.finished_bytes += task.size;
+        self.tasks.insert(task.uid, task);
+        self.prune();
+        if self.log_bytes > self.compact_at {
+            if let Err(e) = self.compact() {
+                eprintln!("[trailhound] cannot rewrite {}: {e}", self.path.display());
+            }
+        }
+    }
+
+    /// Forget the oldest finished tasks beyond the count and size kept.
+    fn prune(&mut self) {
+        while self.finished.len() > KEPT_FINISHED_TASKS || (self.finished_bytes > KEPT_FINISHED_BYTES && self.finished.len() > 1) {
+            let Some(uid) = self.finished.pop_front() else { break };
+            if let Some(task) = self.tasks.remove(&uid) {
+                self.finished_bytes -= task.size;
+            }
+        }
+    }
+
+    /// Rewrite the log with one line per task still known.
+    fn compact(&mut self) -> std::io::Result<()> {
+        let mut compact = Vec::new();
+        for task in self.tasks.values() {
+            compact.extend_from_slice(&serde_json::to_vec(task)?);
+            compact.push(b'\n');
+        }
+        atomic_write(&self.path, &compact).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        self.log = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        self.log_bytes = compact.len() as u64;
+        self.compact_at = (self.log_bytes * 2).max(LOG_COMPACT_BYTES);
         Ok(())
     }
 }
@@ -347,6 +410,7 @@ impl Tenant {
                 finished_at: None,
                 duration_ms: None,
                 retry: false,
+                size: 0,
             };
             store.append(&task, true)?;
             store.next += 1;
@@ -397,13 +461,15 @@ impl Tenant {
             task.finished_at = Some(now_rfc3339());
             task.duration_ms = Some(started.elapsed().as_millis() as u64);
             release_memory();
-            let mut store = self.tasks.lock().unwrap();
-            let _ = store.append(&task, true);
-            store.tasks.insert(task.uid, task);
+            task.kind.slim();
+            self.tasks.lock().unwrap().finish(task);
         }
     }
 
-    fn check_document_quota(&self, incoming: u64) -> Result<(), ApiError> {
+    /// Refuses a write of `incoming` documents taking `incoming_bytes` as
+    /// uploaded when it would take the tenant past its quotas. The upload's
+    /// size stands in for what it will take once indexed, which is less.
+    pub fn check_document_quota(&self, incoming: u64, incoming_bytes: u64) -> Result<(), ApiError> {
         let quotas = self.meta.read().unwrap().quotas.clone();
         if quotas.max_documents.is_none() && quotas.max_storage_bytes.is_none() {
             return Ok(());
@@ -415,7 +481,7 @@ impl Tenant {
             }
         }
         if let Some(max) = quotas.max_storage_bytes {
-            if usage["storageBytes"].as_u64().unwrap_or(0) > max {
+            if usage["storageBytes"].as_u64().unwrap_or(0).saturating_add(incoming_bytes) > max {
                 return Err(ApiError::new(StatusCode::FORBIDDEN, "quota_exceeded", format!("This plan allows at most {max} bytes of storage.")));
             }
         }
@@ -464,7 +530,7 @@ impl Tenant {
                         Err(_) if task.retry => return Ok(json!({})),
                         Err(e) => return Err(ApiError::internal(format!("payload unavailable: {e}"))),
                     };
-                    self.check_document_quota(task.details["receivedDocuments"].as_u64().unwrap_or(0))?;
+                    self.check_document_quota(task.details["receivedDocuments"].as_u64().unwrap_or(0), file.metadata().map_or(0, |m| m.len()))?;
                     let ix = self.index_or_create(&uid, task.uid)?;
                     // One line, one document: the payload is never in memory as a whole.
                     let mut docs = BufReader::with_capacity(1 << 20, file).lines().filter_map(|line| match line {

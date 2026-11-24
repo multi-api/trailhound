@@ -114,7 +114,7 @@ There are three kinds of key:
 
 A tenant can create more keys with `POST /keys`, exactly as in Meilisearch, limited to a set of actions and indexes.
 
-**Quotas** are per tenant: maximum number of indexes, of documents and of bytes on disk. A write that would exceed one is accepted like any other and its task then fails with a `quota_exceeded` error; searches keep working. A **suspended** tenant is refused on every request until it is resumed, and its data is kept.
+**Quotas** are per tenant: maximum number of indexes, of documents and of bytes on disk. A write that would exceed one is accepted like any other and its task then fails with a `quota_exceeded` error; searches keep working. For the disk quota, an upload counts at its uploaded size, which is more than it takes once indexed, so a tenant cannot get past the quota in one large write. A **suspended** tenant is refused on every request until it is resumed, and its data is kept.
 
 **If you only need one tenant,** start the server with `--master-key`. It creates a tenant called `default` with that key, which makes Trailhound a drop-in replacement for a single Meilisearch instance started with the same master key.
 
@@ -271,8 +271,10 @@ Before 1.0, a new minor version may change the on-disk segment format; the chang
 - `GET /health` answers `{"status":"available"}` without a key. Use it for load balancer and container health checks.
 - `GET /stats` (tenant key) and `GET /_admin/api/tenants` (admin key) report documents, disk and searches per index and per tenant.
 - `TRAILHOUND_TRACE=1` prints the time spent in each phase of each search to standard output. The server does not write an access log; take request logs from the proxy.
-- A request body may be up to 256 MB. Send larger imports as several requests; NDJSON is the cheapest format to parse.
-- Each tenant keeps its last 10,000 finished tasks; older ones are dropped at start.
+- A document upload may be up to 256 MB; it is streamed to disk, not held in memory. Send larger imports as several requests; NDJSON is the cheapest format to parse.
+- Every other request body (searches, settings, id lists) may be up to 4 MB, and admin API bodies up to 64 KB.
+- A filter may nest `NOT` and parentheses up to 64 levels deep. A search may ask for up to 100 facets and use up to 10 words and 10 quoted phrases; a `multi-search` request may carry up to 100 queries.
+- Each tenant keeps its last 10,000 finished tasks, or 32 MB of them, whichever is less; older ones are dropped.
 
 ## Configuration
 
@@ -280,7 +282,7 @@ Before 1.0, a new minor version may change the on-disk segment format; the chang
 | --- | --- | --- |
 | `--data-dir` | `TRAILHOUND_DATA_DIR` | Data folder (default `data`) |
 | `--addr` | `TRAILHOUND_ADDR`, `MEILI_HTTP_ADDR` | Listen address (default `127.0.0.1:7700`; the Docker image uses `0.0.0.0:7700`) |
-| `--admin-key` | `TRAILHOUND_ADMIN_KEY` | Key for the panel and `/_admin/api`. If unset, one is generated on first start and stored in `platform.json` |
+| `--admin-key` | `TRAILHOUND_ADMIN_KEY` | Key for the panel and `/_admin/api`, at least 16 characters. If unset, one is generated on first start and stored in `platform.json` |
 | `--master-key` | `TRAILHOUND_MASTER_KEY`, `MEILI_MASTER_KEY` | Creates a `default` tenant with that master key |
 | `--indexing-threads` | `TRAILHOUND_INDEXING_THREADS` | Threads per write (default: one per core, up to 4) |
 | `--indexing-memory-mb` | `TRAILHOUND_INDEXING_MEMORY_MB` | Memory for the index being built, shared by the threads (default 24) |
@@ -335,6 +337,7 @@ Known differences and rough edges:
 
 - `exactness` does not tell an attribute that equals the query from one that only starts with it.
 - With many ties, tied documents come out in a different order than in Meilisearch.
+- A search keeps running on the server after its client disconnects.
 - The `proximity` and `wordPosition` rules are skipped for groups of more than 100,000 tied candidates.
 - `fieldDistribution` also counts deleted documents that have not been through a merge yet.
 - When merging, the sort columns of the resulting segment are built in memory (8 bytes per document and numeric field; one string per document for text fields).

@@ -113,9 +113,15 @@ fn lex(s: &str) -> Result<Vec<Tok>> {
     Ok(out)
 }
 
+/// Deepest nesting of `NOT` and parentheses accepted. Every level is a stack
+/// frame in the parser and again when the filter is evaluated, so an
+/// unbounded filter could overflow the stack and take the process down.
+const MAX_DEPTH: usize = 64;
+
 struct Parser<'a> {
     toks: Vec<Tok>,
     pos: usize,
+    depth: usize,
     src: &'a str,
 }
 
@@ -131,6 +137,14 @@ impl Parser<'_> {
         } else {
             false
         }
+    }
+
+    fn deeper(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(err(format!("The filter is nested more than {MAX_DEPTH} levels deep.")));
+        }
+        Ok(())
     }
 
     fn bad(&self) -> Error {
@@ -170,7 +184,10 @@ impl Parser<'_> {
 
     fn not(&mut self) -> Result<Filter> {
         if self.eat_kw("NOT") {
-            return Ok(Filter::Not(Box::new(self.not()?)));
+            self.deeper()?;
+            let inner = self.not()?;
+            self.depth -= 1;
+            return Ok(Filter::Not(Box::new(inner)));
         }
         self.primary()
     }
@@ -200,7 +217,9 @@ impl Parser<'_> {
     fn primary(&mut self) -> Result<Filter> {
         if self.toks.get(self.pos) == Some(&Tok::LParen) {
             self.pos += 1;
+            self.deeper()?;
             let inner = self.or()?;
+            self.depth -= 1;
             if self.toks.get(self.pos) != Some(&Tok::RParen) {
                 return Err(err(format!("Expression `{}` is missing a closing `)`.", self.src)));
             }
@@ -256,7 +275,7 @@ impl Parser<'_> {
 }
 
 pub fn parse_str(s: &str) -> Result<Filter> {
-    let mut p = Parser { toks: lex(s)?, pos: 0, src: s };
+    let mut p = Parser { toks: lex(s)?, pos: 0, depth: 0, src: s };
     let f = p.or()?;
     if p.pos != p.toks.len() {
         return Err(err(format!("Found unexpected characters at the end of the filter `{s}`.")));

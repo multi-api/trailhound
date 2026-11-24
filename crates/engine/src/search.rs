@@ -16,6 +16,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_QUERY_WORDS: usize = 10;
+/// Quoted phrases beyond these are ignored: each one costs a positional scan.
+const MAX_PHRASES: usize = 10;
+const MAX_PHRASE_WORDS: usize = 16;
+/// Facets a single search may ask for.
+const MAX_FACETS: usize = 100;
 const MAX_DERIVATIONS: usize = 300;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -58,12 +63,15 @@ fn parse_query(q: &str, settings: &Settings) -> (Vec<QWord>, Vec<Vec<String>>) {
     let parts: Vec<&str> = q.split('"').collect();
     for (i, part) in parts.iter().enumerate() {
         let last_part = i == parts.len() - 1;
+        if words.len() >= MAX_QUERY_WORDS && phrases.len() >= MAX_PHRASES {
+            break;
+        }
         let toks = tokenize(part);
         let n = toks.len();
         // An unclosed quote is treated as plain text.
         let quoted = in_quote && !last_part;
-        if quoted && !toks.is_empty() {
-            phrases.push(toks.iter().map(|t| t.text.clone()).collect());
+        if quoted && !toks.is_empty() && phrases.len() < MAX_PHRASES {
+            phrases.push(toks.iter().take(MAX_PHRASE_WORDS).map(|t| t.text.clone()).collect());
         }
         for (j, tok) in toks.into_iter().enumerate() {
             if !quoted && settings.stop_words.contains(&tok.text) {
@@ -890,6 +898,11 @@ fn facet_distribution(st: &State, cands: &Cands, facets: &[String]) -> Result<(V
     } else {
         facets.to_vec()
     };
+    let mut seen = std::collections::HashSet::new();
+    let names: Vec<String> = names.into_iter().filter(|n| seen.insert(n.clone())).collect();
+    if names.len() > MAX_FACETS {
+        return Err(Error::user("invalid_search_facets", format!("A search can ask for at most {MAX_FACETS} facets.")));
+    }
     for name in names {
         if !attr_matches(&settings.filterable_attributes, &name) {
             return Err(Error::user(
@@ -1043,7 +1056,7 @@ pub fn search(st: &State, q: &SearchQuery) -> Result<Value> {
     let paged = q.page.is_some() || q.hits_per_page.is_some();
     let (offset, limit) = if paged {
         let per_page = q.hits_per_page.unwrap_or(20);
-        (q.page.unwrap_or(1).saturating_sub(1) * per_page, per_page)
+        (q.page.unwrap_or(1).saturating_sub(1).saturating_mul(per_page), per_page)
     } else {
         (q.offset.unwrap_or(0), q.limit.unwrap_or(20))
     };
