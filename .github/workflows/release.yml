@@ -93,3 +93,14 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           version="${GITHUB_REF_NAME#v}"
           docker buildx imagetools create -t "$image:$version" -t "$image:latest" "$image:$version-amd64" "$image:$version-arm64"
+
+  dockerhub:
+    name: Docker Hub
+    needs: docker-manifest
+    # Only when Docker Hub publishing has been set up for the repository.
+    if: vars.DOCKERHUB_USERNAME != ''
+    uses: ./.github/workflows/dockerhub.yml
+    with:
+      version: ${{ github.ref_name }}
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
