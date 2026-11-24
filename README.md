@@ -338,6 +338,8 @@ Ranking applies the same rules as Meilisearch 1.58, in the same default order: `
 
 ## What is missing
 
+The [roadmap](ROADMAP.md) says which of these are planned, in what order, and what is out of scope. All of it is open for contribution.
+
 Not implemented:
 
 - `distinctAttribute`, geosearch, CSV uploads, federated search, tenant tokens (JWT), index swaps.
@@ -358,6 +360,8 @@ Known differences and rough edges:
 - Opening a segment verifies the checksum of all its sections, which reads the whole file on start.
 
 ## How it works
+
+A summary; [ARCHITECTURE.md](ARCHITECTURE.md) has the file format, the write and search paths and where each kind of change goes.
 
 - **Immutable segments** (`crates/engine/src/segment.rs`): each batch of documents is written to one file holding the documents in zstd blocks, an FST term dictionary, compressed posting lists, a filter index and sort columns. Files are read through `mmap`, so process memory does not grow with index size.
 - **Lossless documents**: documents are stored and returned with the same key order and the same numbers (`9.50` stays `9.50`; large integers are not rounded).
@@ -462,7 +466,7 @@ npm run dev      # against a Trailhound server on localhost:7700 (or TRAILHOUND_
 npm run build    # regenerates crates/server/src/panel.html
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout of the repository and what a pull request needs, [SECURITY.md](SECURITY.md) to report a vulnerability, and [CHANGELOG.md](CHANGELOG.md) for what changed in each version. The logo, colours and voice are described in [`brand/guide.html`](brand/guide.html).
+See [ROADMAP.md](ROADMAP.md) for what to work on, [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized, [CONTRIBUTING.md](CONTRIBUTING.md) for what a pull request needs, [SECURITY.md](SECURITY.md) to report a vulnerability, and [CHANGELOG.md](CHANGELOG.md) for what changed in each version. The logo, colours and voice are described in [`brand/guide.html`](brand/guide.html).
 
 ## License
 

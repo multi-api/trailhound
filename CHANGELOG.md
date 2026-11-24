@@ -2,6 +2,11 @@
 
 All notable changes to Trailhound are recorded here. The project follows [semantic versioning](https://semver.org); before 1.0, minor versions may change the API and the on-disk format.
 
+## Unreleased
+
+- Roadmap, architecture document, issue forms and a pull request template.
+- CI runs clippy with warnings as errors.
+
 ## 0.1.0 — 2026-11-24
 
 First public version.
