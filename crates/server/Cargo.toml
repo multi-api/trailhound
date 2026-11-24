@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 authors = ["Multi API SpA"]
 description = "Low-memory, multi-tenant search server with a Meilisearch-compatible API."
+repository = "https://github.com/multi-api/trailhound"
 readme = "../../README.md"
 keywords = ["search", "search-engine", "full-text", "meilisearch", "multi-tenant"]
 categories = ["database-implementations", "web-programming::http-server"]
