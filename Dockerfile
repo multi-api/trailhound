@@ -15,4 +15,7 @@ ENV TRAILHOUND_DATA_DIR=/data \
     TRAILHOUND_ADDR=0.0.0.0:7700
 VOLUME /data
 EXPOSE 7700
+# The image has no curl; bash can open the socket itself.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/7700 && printf "GET /health HTTP/1.0\r\n\r\n" >&3 && grep -q available <&3'
 ENTRYPOINT ["trailhound"]

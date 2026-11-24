@@ -2,57 +2,343 @@
 
 **Search that stays on the trail.** A low-memory, multi-tenant search engine with a Meilisearch-compatible API, written in Rust.
 
-Trailhound is built to run many customers on small machines: indexes live on disk in memory-mapped files, so the process stays under about 100 MB while serving eight tenants with 300,000 documents between them. It is an independent implementation and is not affiliated with Meilisearch.
+[![CI](https://github.com/multi-api/trailhound/actions/workflows/ci.yml/badge.svg)](https://github.com/multi-api/trailhound/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Status: 0.1, early.** The API surface listed below works and is tested against the official JavaScript SDK, but the on-disk format may still change between versions and several Meilisearch features are missing. See [What is missing](#what-is-missing).
+Trailhound gives you typo-tolerant, filterable, sortable full-text search over JSON documents. It speaks the Meilisearch HTTP API, so the official Meilisearch SDKs work against it, and it is built for one thing Meilisearch is not: running many customers on a small machine.
 
-## Run it
+- **Small.** Indexes live on disk in memory-mapped files. Eight tenants with 300,000 documents between them are served in about 100 MB of RAM and 72 MB of disk; the same data in Meilisearch takes about 1 GB of RAM and 550 MB of disk. ([Measurements](#comparison-with-meilisearch-1580))
+- **Multi-tenant.** One server holds many isolated tenants, each with its own indexes, API keys, quotas and usage counters.
+- **Compatible.** Indexes, documents, search, settings, tasks and keys follow the Meilisearch API, and results are ranked by the same rules in the same order.
+- **Careful with data.** Documents come back byte for byte as they went in, every block on disk is checksummed, and writes survive a crash or power cut.
+- **One binary.** No external services. The admin panel is embedded.
+
+Trailhound is an independent implementation and is not affiliated with Meilisearch.
+
+> **Status: 0.1.** The API listed under [API compatibility](#api-compatibility) is tested against the official JavaScript SDK on every commit. Several Meilisearch features are not implemented and the on-disk format may still change between minor versions; read [What is missing](#what-is-missing) and [Running in production](#running-in-production) before you depend on it.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Tenants and keys](#tenants-and-keys)
+- [Using an SDK](#using-an-sdk)
+- [Running in production](#running-in-production)
+- [Configuration](#configuration)
+- [Admin panel and admin API](#admin-panel-and-admin-api)
+- [API compatibility](#api-compatibility)
+- [What is missing](#what-is-missing)
+- [How it works](#how-it-works)
+- [Comparison with Meilisearch 1.58.0](#comparison-with-meilisearch-1580)
+- [Development](#development)
+
+## Quick start
+
+With Docker:
+
+```sh
+git clone https://github.com/multi-api/trailhound
+cd trailhound
+docker compose up -d --build
+docker exec trailhound cat /data/platform.json     # shows the admin key
+```
+
+Or from source, with a stable Rust toolchain:
 
 ```sh
 cargo build --release
 target/release/trailhound --data-dir ./data --addr 127.0.0.1:7700
 ```
 
-On first start the server prints the admin key. The admin panel is at `http://127.0.0.1:7700/_admin`.
+The server listens on `http://127.0.0.1:7700`. The first time it starts it generates an admin key, prints it and stores it in `platform.json` inside the data folder.
+
+**1. Create a tenant.** Open `http://127.0.0.1:7700/_admin`, sign in with the admin key and choose "New tenant", or use the admin API:
+
+```sh
+curl -X POST http://127.0.0.1:7700/_admin/api/tenants \
+  -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"name": "Acme", "quotas": {"maxIndexes": 10, "maxDocuments": 100000}}'
+```
+
+The answer carries the tenant's `masterKey` (full access to that tenant; keep it on your server) and `searchKey` (search only; safe to ship to a browser).
+
+**2. Add documents.** The index is created on the first write:
+
+```sh
+curl -X POST "http://127.0.0.1:7700/indexes/books/documents?primaryKey=id" \
+  -H "Authorization: Bearer $MASTER_KEY" -H "Content-Type: application/json" \
+  -d '[
+    {"id": 1, "title": "One Hundred Years of Solitude", "author": "Gabriel Garcia Marquez", "year": 1967},
+    {"id": 2, "title": "The House of the Spirits", "author": "Isabel Allende", "year": 1982},
+    {"id": 3, "title": "Ficciones", "author": "Jorge Luis Borges", "year": 1944}
+  ]'
+```
+
+Writes are asynchronous, as in Meilisearch: the answer is `202` with a `taskUid`, and `GET /tasks/{taskUid}` tells you when it has `succeeded`.
+
+**3. Search,** typos included:
+
+```sh
+curl -X POST http://127.0.0.1:7700/indexes/books/search \
+  -H "Authorization: Bearer $SEARCH_KEY" -H "Content-Type: application/json" \
+  -d '{"q": "garsia marques"}'
+```
+
+```json
+{"hits":[{"id":1,"title":"One Hundred Years of Solitude","author":"Gabriel Garcia Marquez","year":1967}],
+ "query":"garsia marques","processingTimeMs":0,"limit":20,"offset":0,"estimatedTotalHits":1}
+```
+
+**4. Filter and sort.** Declare the attributes first, then use them:
+
+```sh
+curl -X PATCH http://127.0.0.1:7700/indexes/books/settings \
+  -H "Authorization: Bearer $MASTER_KEY" -H "Content-Type: application/json" \
+  -d '{"filterableAttributes": ["year"], "sortableAttributes": ["year"]}'
+
+curl -X POST http://127.0.0.1:7700/indexes/books/search \
+  -H "Authorization: Bearer $SEARCH_KEY" -H "Content-Type: application/json" \
+  -d '{"q": "", "filter": "year > 1950", "sort": ["year:desc"], "attributesToRetrieve": ["title", "year"]}'
+```
+
+## Tenants and keys
+
+A **tenant** is one customer or project of yours. Tenants are isolated: each has its own folder on disk, indexes, API keys, task queue, quotas and usage counters. There is no tenant id in the URL; the API key of a request decides which tenant it belongs to.
+
+There are three kinds of key:
+
+| Key | Who holds it | What it can do |
+| --- | --- | --- |
+| Admin key | You, the operator | Create, suspend and delete tenants, set quotas, rotate keys. Works only on `/_admin` |
+| Tenant master key | The tenant's backend | Everything inside that tenant: indexes, documents, settings, tasks, API keys |
+| Tenant API keys | The tenant's applications | Only the actions and indexes each key was created with. Every tenant starts with one search-only key |
+
+A tenant can create more keys with `POST /keys`, exactly as in Meilisearch, limited to a set of actions and indexes.
+
+**Quotas** are per tenant: maximum number of indexes, of documents and of bytes on disk. A write that would exceed one is accepted like any other and its task then fails with a `quota_exceeded` error; searches keep working. A **suspended** tenant is refused on every request until it is resumed, and its data is kept.
+
+**If you only need one tenant,** start the server with `--master-key`. It creates a tenant called `default` with that key, which makes Trailhound a drop-in replacement for a single Meilisearch instance started with the same master key.
+
+## Using an SDK
+
+Point any Meilisearch client at the server with a tenant key. With the official JavaScript SDK:
+
+```js
+import { MeiliSearch } from 'meilisearch'
+
+const client = new MeiliSearch({ host: 'https://search.example.com', apiKey: process.env.TRAILHOUND_KEY })
+
+await client.index('books').addDocuments(books, { primaryKey: 'id' })
+const { hits } = await client.index('books').search('garsia marques', { filter: 'year > 1950' })
+```
+
+`tests/sdk/compat.mjs` runs 34 checks with `meilisearch-js` 0.63.0 on every commit. Other SDKs use the same HTTP API but are not tested here.
+
+## Running in production
+
+A checklist first; the details follow.
+
+- [ ] Run behind a reverse proxy that terminates TLS. Trailhound speaks plain HTTP.
+- [ ] Do not expose `/_admin` to the internet. Block it at the proxy or restrict it by IP.
+- [ ] Set `TRAILHOUND_ADMIN_KEY` yourself, to a long random value, from your secrets store.
+- [ ] Keep the data folder on a persistent volume, readable only by the server's user. Keys are stored there in clear text.
+- [ ] Give each tenant quotas, and use search-only keys in browsers and mobile apps.
+- [ ] Add request rate limiting at the proxy. Trailhound has none.
+- [ ] Back up the data folder, and test a restore.
+- [ ] Monitor `GET /health` and the memory and disk of the host.
+
+### Docker
+
+`docker-compose.yml` in this repository is a working starting point: it binds the port to `127.0.0.1` only, keeps the data in a named volume, restarts the server unless stopped, limits it to 256 MB of memory and runs as an unprivileged user. Set the admin key in an `.env` file or your orchestrator's secrets rather than in the file itself:
+
+```yaml
+services:
+  trailhound:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7700:7700"
+    volumes:
+      - trailhound-data:/data
+    mem_limit: 256m
+    environment:
+      TRAILHOUND_ADMIN_KEY: ${TRAILHOUND_ADMIN_KEY}
+
+volumes:
+  trailhound-data:
+```
+
+The image has a health check on `/health`. On `docker stop` the server stops accepting connections, lets requests in flight finish and saves its usage counters.
+
+### Binary with systemd
+
+```ini
+[Unit]
+Description=Trailhound search server
+After=network.target
+
+[Service]
+User=trailhound
+ExecStart=/usr/local/bin/trailhound
+Environment=TRAILHOUND_DATA_DIR=/var/lib/trailhound
+Environment=TRAILHOUND_ADDR=127.0.0.1:7700
+EnvironmentFile=/etc/trailhound/env
+Restart=on-failure
+MemoryMax=256M
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/trailhound
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Put `TRAILHOUND_ADMIN_KEY=...` in `/etc/trailhound/env`, owned by root with mode `600`.
+
+### Reverse proxy
+
+With Caddy, which obtains the certificate for you. This serves the search API publicly and keeps the admin panel reachable from one address only:
+
+```
+search.example.com {
+    @admin_from_outside {
+        path /_admin*
+        not remote_ip 203.0.113.10
+    }
+    respond @admin_from_outside 403
+
+    reverse_proxy 127.0.0.1:7700
+}
+```
+
+With nginx, inside a `server` block that already has TLS configured:
+
+```nginx
+client_max_body_size 256m;            # Trailhound accepts request bodies up to 256 MB
+
+location /_admin {
+    allow 203.0.113.10;
+    deny all;
+    proxy_pass http://127.0.0.1:7700;
+}
+
+location / {
+    proxy_pass http://127.0.0.1:7700;
+    proxy_request_buffering off;      # stream large document uploads straight through
+}
+```
+
+The server answers CORS requests from any origin, which is what lets a browser search directly with a search key. Restrict origins at the proxy if you need to.
+
+### Sizing
+
+These figures come from the benchmarks below, with synthetic documents of about 320 bytes each; measure with your own data.
+
+| Resource | What to expect |
+| --- | --- |
+| Memory | 45 MB at rest and about 100 MB under load for 300,000 documents in 8 tenants. Indexing peaks at about 95 MB. A 256 MB limit leaves room; the simulated 512 MB, 2-vCPU machine ran it comfortably |
+| Disk | About two thirds of the size of the documents as NDJSON (63 MB for 95 MB). Leave free space for merges, which rewrite the segments they join |
+| CPU | Searches use one thread each when several run at once. About 1,100 queries per second per core on x86 for the benchmark's query mix |
+| Indexing memory | `TRAILHOUND_INDEXING_MEMORY_MB` (default 24) caps the index under construction. Raise it for faster bulk loads, lower it on very small machines |
+
+Memory use depends on what is being searched, not on how much is stored: index files are memory-mapped and the operating system keeps in memory only the pages in use.
+
+### Data folder and backups
+
+```
+data/
+  platform.json            admin key and the list of tenants, with their master keys and quotas
+  tenants/<tenant id>/
+    keys.json              the tenant's API keys
+    tasks.log              the task queue and history
+    payloads/              uploaded documents waiting to be indexed
+    indexes/<index uid>/   segments, settings and manifest
+    usage.json             usage counters
+```
+
+Everything the server knows is in this folder; restoring it restores the server. There is no dump or snapshot command yet, so back up at the filesystem level:
+
+- **Simplest:** stop the server, archive the folder (or the Docker volume), start it again.
+- **Without downtime:** take an atomic snapshot of the volume (LVM, ZFS, EBS and similar). The folder is always in a state the server can start from, because writes replace the manifest atomically and unfinished tasks are replayed on start.
+
+Copying the folder file by file while the server is writing is not safe: the copy can mix files from before and after a write.
+
+### Upgrades
+
+Before 1.0, a new minor version may change the on-disk segment format; the changelog says when it does. A server refuses to open segments in a format it does not know rather than misread them. Until an in-place migration exists, upgrading across a format change means loading the documents again into the new version, so keep the source of your documents.
+
+### Monitoring and limits
+
+- `GET /health` answers `{"status":"available"}` without a key. Use it for load balancer and container health checks.
+- `GET /stats` (tenant key) and `GET /_admin/api/tenants` (admin key) report documents, disk and searches per index and per tenant.
+- `TRAILHOUND_TRACE=1` prints the time spent in each phase of each search to standard output. The server does not write an access log; take request logs from the proxy.
+- A request body may be up to 256 MB. Send larger imports as several requests; NDJSON is the cheapest format to parse.
+- Each tenant keeps its last 10,000 finished tasks; older ones are dropped at start.
+
+## Configuration
 
 | Flag | Environment variable | Purpose |
 | --- | --- | --- |
 | `--data-dir` | `TRAILHOUND_DATA_DIR` | Data folder (default `data`) |
-| `--addr` | `TRAILHOUND_ADDR`, `MEILI_HTTP_ADDR` | Listen address |
-| `--admin-key` | `TRAILHOUND_ADMIN_KEY` | Key for the panel and `/_admin/api` |
-| `--master-key` | `TRAILHOUND_MASTER_KEY`, `MEILI_MASTER_KEY` | Creates a `default` tenant with that key: drop-in replacement for a single Meilisearch instance |
+| `--addr` | `TRAILHOUND_ADDR`, `MEILI_HTTP_ADDR` | Listen address (default `127.0.0.1:7700`; the Docker image uses `0.0.0.0:7700`) |
+| `--admin-key` | `TRAILHOUND_ADMIN_KEY` | Key for the panel and `/_admin/api`. If unset, one is generated on first start and stored in `platform.json` |
+| `--master-key` | `TRAILHOUND_MASTER_KEY`, `MEILI_MASTER_KEY` | Creates a `default` tenant with that master key |
 | `--indexing-threads` | `TRAILHOUND_INDEXING_THREADS` | Threads per write (default: one per core, up to 4) |
 | `--indexing-memory-mb` | `TRAILHOUND_INDEXING_MEMORY_MB` | Memory for the index being built, shared by the threads (default 24) |
-
-### With Docker
-
-```sh
-docker compose up -d --build
-docker exec trailhound cat /data/platform.json   # shows the admin key
-```
-
-The server listens on `http://127.0.0.1:7700`, keeps its data in the `trailhound-data` volume and is limited to 256 MB of memory. The admin key is also printed in `docker logs trailhound` the first time the container starts.
+| | `TRAILHOUND_TRACE` | `1` prints per-phase search timings |
 
 On Windows the linker fails (`LNK1104`) when the project path is very long; build from a short path or set `CARGO_TARGET_DIR`.
 
-## Tenants
+## Admin panel and admin API
 
-Trailhound is multi-tenant: one server holds many isolated customers or projects. Each tenant has its own folder, API keys, task queue, limits and usage counters, and the API key of a request decides which tenant it belongs to.
+The panel at `/_admin` lists tenants with their usage, creates, suspends and deletes them, shows and rotates their keys, edits quotas and runs test searches. It is in English by default, with Spanish available, follows the system's light or dark mode and loads nothing from other servers.
 
-Create a tenant in the admin panel (or with `POST /_admin/api/tenants`) to get its master key and search key, then point any Meilisearch client at the server with that key. If you only need one tenant, start the server with `--master-key` instead.
+Everything the panel does goes through the admin API, authenticated with `Authorization: Bearer <admin key>`:
 
-## Admin panel
+| Request | Effect |
+| --- | --- |
+| `GET /_admin/api/tenants` | List tenants with keys, quotas, usage, indexes and task counts |
+| `POST /_admin/api/tenants` | Create one. Body: `{"name": "...", "quotas": {"maxIndexes", "maxDocuments", "maxStorageBytes"}}`; quotas are optional and `null` means no limit |
+| `PATCH /_admin/api/tenants/{id}` | Change `name`, `suspended` or `quotas` |
+| `POST /_admin/api/tenants/{id}/rotate-key` | Replace the master key; the old one stops working immediately |
+| `DELETE /_admin/api/tenants/{id}` | Delete the tenant and all its data |
 
-The panel (`/_admin`) is a React, Tailwind and shadcn/ui application in `panel/`. It builds into a single HTML file (571 KB, no external resources) at `crates/server/src/panel.html`, which is embedded in the binary, so `cargo build` does not need Node. It is in English by default, with Spanish available, and follows the system's light or dark mode.
+## API compatibility
 
-To change it:
+Implemented, following the Meilisearch API:
 
-```sh
-cd panel
-npm install
-npm run dev      # against a Trailhound server on localhost:7700 (or TRAILHOUND_URL)
-npm run build    # regenerates crates/server/src/panel.html
-```
+| Area | Supported |
+| --- | --- |
+| Indexes | Create, list, get, update the primary key, delete, stats |
+| Documents | JSON and NDJSON; add or replace, partial update, get, fetch, delete by id, by batch and by filter |
+| Search | `q`, typo tolerance, prefix search, phrase search with quotes, `filter`, `sort`, `facets`, `limit`/`offset` and `page`/`hitsPerPage`, highlighting, cropping, `matchingStrategy`, `attributesToSearchOn`, `attributesToRetrieve`, `showMatchesPosition`; `POST /multi-search` |
+| Settings | The settings object and its sub-routes: searchable, filterable, sortable and displayed attributes, ranking rules, stop words, synonyms, typo tolerance, faceting, pagination |
+| Tasks | List and get, with the Meilisearch task shape |
+| Keys | Create, list, get, update, delete, with actions and indexes |
+| Other | `health`, `version`, `stats` |
+
+Ranking applies the same rules as Meilisearch 1.58, in the same default order: `words`, `typo`, `proximity`, `attributeRank`, `sort`, `wordPosition`, `exactness` (the older name `attribute` means `attributeRank` plus `wordPosition`). Typos are counted the same way: swapping two neighbouring letters is one typo, and a typo in the first letter counts as two.
+
+`GET /version` reports `pkgVersion` `1.12.0` so that SDKs that check the server version accept it; the real version is in the `engine` field.
+
+## What is missing
+
+Not implemented:
+
+- `distinctAttribute`, geosearch, CSV uploads, federated search, tenant tokens (JWT), index swaps.
+- Vector and hybrid search.
+- Dumps and snapshots, and task cancellation and deletion.
+- TLS, request rate limiting and access logs. Use a reverse proxy.
+- Encryption of keys at rest: API keys are stored in clear text in the data folder.
+- Replication and clustering: a server is a single node.
+
+Known differences and rough edges:
+
+- `exactness` does not tell an attribute that equals the query from one that only starts with it.
+- With many ties, tied documents come out in a different order than in Meilisearch.
+- The `proximity` and `wordPosition` rules are skipped for groups of more than 100,000 tied candidates.
+- `fieldDistribution` also counts deleted documents that have not been through a merge yet.
+- When merging, the sort columns of the resulting segment are built in memory (8 bytes per document and numeric field; one string per document for text fields).
+- Opening a segment verifies the checksum of all its sections, which reads the whole file on start.
 
 ## How it works
 
@@ -65,21 +351,6 @@ npm run build    # regenerates crates/server/src/panel.html
 - **Merging** (`segment::merge`): above 8 segments, the 5 smallest are merged without reindexing: documents are copied block by block and dictionaries are merged as sorted streams, dropping deleted documents. Merges under 400,000 documents copy the compressed blocks as they are; larger ones recompress at zstd level 19.
 - **Search** (`crates/engine/src/search.rs`): typo tolerance walks the dictionary with an automaton computed on the fly. Range filters use precomputed unions over spans of 64 and 4,096 values. A lone search spreads segments across cores; concurrent searches use one thread each.
 - **Stable memory** (`tune_allocator`): on Linux the server limits what glibc keeps after freeing. `TRAILHOUND_TRACE=1` prints the time spent in each phase of each search.
-
-## Meilisearch-compatible API
-
-Indexes, documents (JSON and NDJSON; add, replace, partial update, delete by id, by batch and by filter), search (`q`, typos, prefix, `filter`, `sort`, `facets`, pagination, highlighting, cropping, `matchingStrategy`, `attributesToSearchOn`, `showMatchesPosition`), `multi-search`, settings and their sub-routes, tasks, API keys with actions and indexes, `stats`, `health`, `version`.
-
-Ranking applies the same rules as Meilisearch 1.58, in the same default order: `words`, `typo`, `proximity`, `attributeRank`, `sort`, `wordPosition`, `exactness` (the older name `attribute` means `attributeRank` plus `wordPosition`). Typos are counted the same way: swapping two neighbouring letters is one typo, and a typo in the first letter counts as two. Quoted phrases require the words to be adjacent and in order.
-
-### SDK compatibility test
-
-`tests/sdk/compat.mjs` runs 34 checks with `meilisearch-js` 0.63.0 against a running server:
-
-```sh
-target/release/trailhound --data-dir ./data-test --addr 127.0.0.1:7711 --master-key test-master-key
-cd tests/sdk && npm install && npm test
-```
 
 ## Comparison with Meilisearch 1.58.0
 
@@ -151,21 +422,30 @@ How to read these tables:
 - The `proximity` and `wordPosition` rules, and the part of `exactness` that looks at the start of the attribute, are skipped for groups of more than 100,000 tied candidates.
 - The data is synthetic; proportions may change with real text.
 
-## What is missing
+## Development
 
-- `distinctAttribute`, geosearch, CSV, federated search, tenant tokens (JWT), dumps and snapshots, task cancellation and deletion, index swaps.
-- Vector and hybrid search.
-- TLS and per-tenant rate limiting. Put a TLS proxy in front to expose the server.
-- API keys are stored in clear text on disk.
-- `exactness` does not tell an attribute that equals the query from one that only starts with it.
-- With many ties, tied documents come out in a different order than in Meilisearch.
-- `fieldDistribution` also counts deleted documents that have not been through a merge yet.
-- When merging, the sort columns of the resulting segment are built in memory (8 bytes per document and numeric field; one string per document for text fields).
-- Opening a segment verifies the CRC of all its sections, which reads the whole file on start.
+```sh
+cargo build --release
+cargo test --release                 # engine tests
+```
 
-## Brand
+SDK compatibility test, against a running server:
 
-Logo, colours, typography and voice are described in [`brand/guide.html`](brand/guide.html).
+```sh
+target/release/trailhound --data-dir ./data-test --addr 127.0.0.1:7711 --master-key test-master-key
+cd tests/sdk && npm install && npm test
+```
+
+The admin panel is a React, Tailwind and shadcn/ui application in `panel/`. It builds into a single HTML file at `crates/server/src/panel.html`, which is committed and embedded in the binary, so `cargo build` does not need Node:
+
+```sh
+cd panel
+npm install
+npm run dev      # against a Trailhound server on localhost:7700 (or TRAILHOUND_URL)
+npm run build    # regenerates crates/server/src/panel.html
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout of the repository and what a pull request needs, [SECURITY.md](SECURITY.md) to report a vulnerability, and [CHANGELOG.md](CHANGELOG.md) for what changed in each version. The logo, colours and voice are described in [`brand/guide.html`](brand/guide.html).
 
 ## License
 

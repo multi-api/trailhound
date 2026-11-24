@@ -92,8 +92,23 @@ async fn serve() {
     }
 
     let on_exit: Arc<Platform> = platform.clone();
+    // Ctrl-C, or SIGTERM from `docker stop`, systemd or Kubernetes: stop
+    // accepting connections, let requests in flight finish, save the counters.
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        println!("[trailhound] shutting down");
     };
     if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(shutdown).await {
         eprintln!("[trailhound] server error: {e}");
