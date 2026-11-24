@@ -26,9 +26,7 @@ fn titles(res: &Value) -> Vec<String> {
 fn setup(dir: &std::path::Path) -> Index {
     let index = Index::create(dir, "movies", None, 0).unwrap();
     index.add_documents(movies(), None, false, 1).unwrap();
-    let mut s = Settings::default();
-    s.filterable_attributes = vec!["genres".into(), "year".into()];
-    s.sortable_attributes = vec!["year".into(), "title".into(), "rating".into()];
+    let s = Settings { filterable_attributes: vec!["genres".into(), "year".into()], sortable_attributes: vec!["year".into(), "title".into(), "rating".into()], ..Default::default() };
     index.update_settings(s, 2).unwrap();
     index
 }
@@ -111,7 +109,7 @@ fn many_batches_merge_and_stay_consistent() {
     let (docs, total) = index.list_documents(10, 5, None).unwrap();
     assert_eq!((docs.len(), total), (5, 29 * 25 + 50));
     // Corrupting a stored block must be detected, not served.
-    let seg = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().map_or(false, |e| e == "seg")).unwrap();
+    let seg = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "seg")).unwrap();
     drop(index);
     let mut bytes = std::fs::read(&seg).unwrap();
     bytes[20] ^= 0xff;
@@ -124,13 +122,11 @@ fn many_batches_merge_and_stay_consistent() {
 fn phrases_and_proximity() {
     let dir = tempfile::tempdir().unwrap();
     let index = Index::create(dir.path(), "p", Some("id".into()), 0).unwrap();
-    let docs = vec![
-        json!({"id": 1, "title": "motor de busqueda rapido"}),
+    let docs = [json!({"id": 1, "title": "motor de busqueda rapido"}),
         json!({"id": 2, "title": "busqueda con un motor lento"}),
         json!({"id": 3, "title": "motor electrico", "tags": ["de", "busqueda"]}),
         json!({"id": 4, "title": "el motor muy rapido y silencioso de busqueda"}),
-        json!({"id": 5, "title": "motor busqueda"}),
-    ];
+        json!({"id": 5, "title": "motor busqueda"})];
     // Two batches, so phrases and proximity also work across segments.
     index.add_documents(docs[..3].to_vec(), None, false, 1).unwrap();
     index.add_documents(docs[3..].to_vec(), None, false, 2).unwrap();
@@ -194,10 +190,7 @@ fn large_writes_are_chunked_and_keep_the_last_version() {
 #[test]
 fn merged_index_matches_a_fresh_one() {
     let settings = || {
-        let mut s = Settings::default();
-        s.filterable_attributes = vec!["tag".into(), "price".into(), "extra".into()];
-        s.sortable_attributes = vec!["price".into(), "name".into()];
-        s
+        Settings { filterable_attributes: vec!["tag".into(), "price".into(), "extra".into()], sortable_attributes: vec!["price".into(), "name".into()], ..Default::default() }
     };
     let make = |i: u64| json!({"id": i, "title": format!("alfa beta {i} gamma"), "tag": [(["x", "y", "z"][(i % 3) as usize]), "todos"], "price": i as f64 / 2.0, "name": format!("nombre {:04}", (i * 37) % 1000)});
     let dir = tempfile::tempdir().unwrap();
@@ -282,9 +275,7 @@ fn merged_index_matches_a_fresh_one() {
 fn nested_fields_survive_parallel_indexing() {
     let dir = tempfile::tempdir().unwrap();
     let index = Index::create(dir.path(), "n", Some("id".into()), 0).unwrap();
-    let mut s = Settings::default();
-    s.filterable_attributes = vec!["meta".into(), "tags".into(), "vacio".into()];
-    s.sortable_attributes = vec!["meta.peso".into()];
+    let s = Settings { filterable_attributes: vec!["meta".into(), "tags".into(), "vacio".into()], sortable_attributes: vec!["meta.peso".into()], ..Default::default() };
     index.update_settings(s, 1).unwrap();
     // New fields keep appearing deep into the stream, in every shape.
     let docs: Vec<Value> = (0..6_000u64)
@@ -326,8 +317,7 @@ fn nested_fields_survive_parallel_indexing() {
 fn range_filters_match_a_full_scan() {
     let dir = tempfile::tempdir().unwrap();
     let index = Index::create(dir.path(), "r", Some("id".into()), 0).unwrap();
-    let mut s = Settings::default();
-    s.filterable_attributes = vec!["n".into(), "few".into()];
+    let s = Settings { filterable_attributes: vec!["n".into(), "few".into()], ..Default::default() };
     index.update_settings(s, 1).unwrap();
     // 9,000 distinct values (two levels of runs), negatives, repeats and gaps.
     let value = |i: u64| -> f64 { ((i * 7919) % 9000) as f64 * 0.25 - 600.0 };
