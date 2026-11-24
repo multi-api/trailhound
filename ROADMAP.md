@@ -8,7 +8,7 @@ Nothing here is assigned or dated. Every item is open for contribution:
 - [ARCHITECTURE.md](ARCHITECTURE.md) explains how the code is put together and where each kind of change goes.
 - [CONTRIBUTING.md](CONTRIBUTING.md) says how to build, test and what a pull request needs.
 
-Status is one of **not started**, **in progress** or **done**. If you start on something, say so in its issue and we will update this page.
+Items that already have an issue link to it; that is the place to ask questions or say you are taking it. Status is one of **not started**, **in progress** or **done**. If you start on something, say so in its issue and we will update this page.
 
 ## 1. Compatibility where people already are
 
@@ -21,9 +21,9 @@ The HTTP API is the same for every SDK, but each SDK exercises it differently (r
 | Item | What and why | Status |
 | --- | --- | --- |
 | JavaScript | 34 checks with the official `meilisearch-js` in `tests/sdk`, run on every commit. | Done |
-| PHP and Laravel Scout | A test suite with `meilisearch-php` and one with Scout's Meilisearch driver. Laravel is where a large share of small Meilisearch deployments live, and they are the ones a low-memory server suits best. | Not started |
-| Python | The same with the official `meilisearch` Python package. | Not started |
-| Go | The same with `meilisearch-go`. | Not started |
+| [PHP and Laravel Scout](https://github.com/multi-api/trailhound/issues/3) | A test suite with `meilisearch-php` and one with Scout's Meilisearch driver. Laravel is where a large share of small Meilisearch deployments live, and they are the ones a low-memory server suits best. | Not started |
+| [Python](https://github.com/multi-api/trailhound/issues/2) | The same with the official `meilisearch` Python package. | Not started |
+| [Go](https://github.com/multi-api/trailhound/issues/4) | The same with `meilisearch-go`. | Not started |
 
 ### Meilisearch features that are missing
 
@@ -31,13 +31,13 @@ In the order we expect people to miss them.
 
 | Item | What and why | Status |
 | --- | --- | --- |
-| `distinctAttribute` | Return one hit per value of an attribute (one result per product, not per variant). The setting is already accepted and stored, but search ignores it. | Not started |
-| CSV uploads | Accept `text/csv` on the document routes, with Meilisearch's header syntax for types. Many imports start from a spreadsheet export. | Not started |
-| Tenant tokens (JWT) | Tokens signed with an API key that carry search rules (a forced filter per index). They let a browser search only the rows its user may see, without a backend in between. | Not started |
-| Task cancellation and deletion | `POST /tasks/cancel` and `DELETE /tasks`. A wrong 200 MB import should be stoppable without restarting the server. | Not started |
-| Geosearch | The `_geo` field, `_geoRadius` and `_geoBoundingBox` filters and `_geoPoint` sorting. Needed by any store locator or listing site. | Not started |
+| [`distinctAttribute`](https://github.com/multi-api/trailhound/issues/7) | Return one hit per value of an attribute (one result per product, not per variant). The setting is already accepted and stored, but search ignores it. | Not started |
+| [CSV uploads](https://github.com/multi-api/trailhound/issues/5) | Accept `text/csv` on the document routes, with Meilisearch's header syntax for types. Many imports start from a spreadsheet export. | Not started |
+| [Tenant tokens (JWT)](https://github.com/multi-api/trailhound/issues/9) | Tokens signed with an API key that carry search rules (a forced filter per index). They let a browser search only the rows its user may see, without a backend in between. | Not started |
+| [Task cancellation and deletion](https://github.com/multi-api/trailhound/issues/8) | `POST /tasks/cancel` and `DELETE /tasks`. A wrong 200 MB import should be stoppable without restarting the server. | Not started |
+| [Geosearch](https://github.com/multi-api/trailhound/issues/10) | The `_geo` field, `_geoRadius` and `_geoBoundingBox` filters and `_geoPoint` sorting. Needed by any store locator or listing site. | Not started |
 
-Smaller gaps, each a good self-contained change: multi-word synonyms (only one-word synonyms are applied), `typoTolerance.disableOnAttributes` (stored, not applied), index swaps, federated search, and the known differences listed in the [README](README.md#what-is-missing).
+Smaller gaps, each a good self-contained change: multi-word synonyms (only one-word synonyms are applied), [`typoTolerance.disableOnAttributes`](https://github.com/multi-api/trailhound/issues/6) (stored, not applied), index swaps, federated search, and the known differences listed in the [README](README.md#what-is-missing).
 
 ## 2. Easy adoption
 
@@ -57,9 +57,9 @@ A search engine that keeps other people's data has to earn it. These are the thi
 | --- | --- | --- |
 | A benchmark with real data, at scale | The published figures use 300,000 synthetic documents with an 80-word vocabulary. We want the same comparison on real text (several million documents, natural vocabulary), with the scripts and data sources in the repository so anyone can repeat it. | Not started |
 | CPU per query and p99 latency | Meilisearch uses less CPU per query and has a better latency tail, because it precomputes on disk what Trailhound computes while searching. The work is to find what the slow queries have in common and make them cheaper without spending the memory that is the point of the project. | Not started |
-| Fuzzing and crash tests in CI | Fuzz targets for the filter parser, the document scanner and the segment reader (a damaged file must give an error, never a panic or wrong data), and a test that kills the server in the middle of writes and checks what it finds on restart. | Not started |
-| API keys stored as hashes | Tenant and API keys are stored in clear text in the data folder. Storing a hash means a leaked backup does not leak working keys. It changes what the admin panel and `GET /keys` can show, which needs a decision. | Not started |
-| Prometheus metrics | A `/metrics` endpoint with request counts and latencies, task queue depth, and documents, disk and searches per tenant. Today monitoring means polling `/stats` and the admin API. | Not started |
+| [Fuzzing and crash tests in CI](https://github.com/multi-api/trailhound/issues/11) | Fuzz targets for the filter parser, the document scanner and the segment reader (a damaged file must give an error, never a panic or wrong data), and a test that kills the server in the middle of writes and checks what it finds on restart. | Not started |
+| [API keys stored as hashes](https://github.com/multi-api/trailhound/issues/13) | Tenant and API keys are stored in clear text in the data folder. Storing a hash means a leaked backup does not leak working keys. It changes what the admin panel and `GET /keys` can show, which needs a decision. | Not started |
+| [Prometheus metrics](https://github.com/multi-api/trailhound/issues/12) | A `/metrics` endpoint with request counts and latencies, task queue depth, and documents, disk and searches per tenant. Today monitoring means polling `/stats` and the admin API. | Not started |
 
 ## 4. Contributor experience
 
