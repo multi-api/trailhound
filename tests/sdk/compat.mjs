@@ -2,7 +2,8 @@
 import { Meilisearch } from 'meilisearch';
 import assert from 'node:assert/strict';
 
-const client = new Meilisearch({ host: 'http://127.0.0.1:7711', apiKey: 'test-master-key' });
+const host = process.env.TRAILHOUND_URL ?? 'http://127.0.0.1:7711';
+const client = new Meilisearch({ host, apiKey: 'test-master-key' });
 const uid = 'sdk_books';
 let pass = 0;
 const failures = [];
@@ -106,7 +107,7 @@ await check('keys: create, get, update, restricted use, delete', async () => {
   assert.equal((await client.getKey(k.uid)).name, 'solo libros');
   assert.equal((await client.updateKey(k.uid, { description: 'x' })).description, 'x');
   assert.ok((await client.getKeys({ limit: 50 })).results.some((x) => x.uid === k.uid));
-  const limited = new Meilisearch({ host: 'http://127.0.0.1:7711', apiKey: k.key });
+  const limited = new Meilisearch({ host, apiKey: k.key });
   assert.equal((await limited.index(uid).search('rayuela')).hits[0].id, 3);
   await assert.rejects(limited.index('products').search('x'), (e) => { assert.equal(e.cause.code, 'invalid_api_key'); return true; });
   await assert.rejects(limited.index(uid).addDocuments([{ id: 99 }]), (e) => { assert.equal(e.cause.code, 'invalid_api_key'); return true; });
@@ -120,3 +121,4 @@ await check('deleteIndex', async () => { await done(client.deleteIndex(uid)); aw
 
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) console.log('failed: ' + failures.join(' | '));
+process.exit(failures.length ? 1 : 0);

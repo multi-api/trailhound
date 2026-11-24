@@ -47,6 +47,76 @@ jobs:
         working-directory: tests/sdk
         run: npm ci && npm test
 
+  sdk-python:
+    name: SDK compatibility (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo build --release --locked
+      - name: Start the server
+        run: |
+          target/release/trailhound --data-dir "$RUNNER_TEMP/data" --addr 127.0.0.1:7711 --master-key test-master-key &
+          for i in $(seq 1 50); do curl -sf http://127.0.0.1:7711/health >/dev/null && exit 0; sleep 0.2; done
+          echo "server did not start" >&2; exit 1
+      - name: Run the meilisearch-python checks
+        working-directory: tests/sdk-python
+        run: pip install -r requirements.txt && python compat.py
+
+  sdk-go:
+    name: SDK compatibility (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/sdk-go/go.mod
+          cache-dependency-path: tests/sdk-go/go.sum
+      - run: cargo build --release --locked
+      - name: Start the server
+        run: |
+          target/release/trailhound --data-dir "$RUNNER_TEMP/data" --addr 127.0.0.1:7711 --master-key test-master-key &
+          for i in $(seq 1 50); do curl -sf http://127.0.0.1:7711/health >/dev/null && exit 0; sleep 0.2; done
+          echo "server did not start" >&2; exit 1
+      - name: Run the meilisearch-go checks
+        working-directory: tests/sdk-go
+        run: go run .
+
+  sdk-php:
+    name: SDK compatibility (PHP and Laravel Scout)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: curl, mbstring, pdo_sqlite
+          tools: composer:v2
+          coverage: none
+      - run: cargo build --release --locked
+      - name: Start the server
+        run: |
+          target/release/trailhound --data-dir "$RUNNER_TEMP/data" --addr 127.0.0.1:7711 --master-key test-master-key &
+          for i in $(seq 1 50); do curl -sf http://127.0.0.1:7711/health >/dev/null && exit 0; sleep 0.2; done
+          echo "server did not start" >&2; exit 1
+      - name: Run the meilisearch-php checks
+        working-directory: tests/sdk-php
+        run: composer install --no-interaction --no-progress && php compat.php
+      - name: Run the Laravel Scout checks
+        working-directory: tests/sdk-laravel
+        run: |
+          composer install --no-interaction --no-progress
+          cp .env.example .env
+          php compat.php
+
   panel:
     name: Admin panel
     runs-on: ubuntu-latest
