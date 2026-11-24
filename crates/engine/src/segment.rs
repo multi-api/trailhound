@@ -1,6 +1,6 @@
 //! Immutable segment files.
 //!
-//! Layout: MAGIC, nine sections, footer. The footer holds the offset, length
+//! Layout: MAGIC, ten sections, footer. The footer holds the offset, length
 //! and CRC32 of every section, its own CRC32, and MAGIC again. Documents are
 //! stored as zstd blocks, each with its own CRC, so a damaged block is
 //! detected when it is read instead of being served.
@@ -681,12 +681,10 @@ impl SegmentBuilder {
                         }
                     }
                 }
-                Value::String(s) => {
-                    if col.strs.last().map(|l| l.0) != Some(docid) {
-                        let norm = normalize_facet(s);
-                        self.mem += norm.len() + 40;
-                        col.strs.push((docid, norm));
-                    }
+                Value::String(s) if col.strs.last().map(|l| l.0) != Some(docid) => {
+                    let norm = normalize_facet(s);
+                    self.mem += norm.len() + 40;
+                    col.strs.push((docid, norm));
                 }
                 _ => {}
             }
@@ -736,7 +734,7 @@ impl SegmentBuilder {
         let mut terms = terms.into_iter().peekable();
         while let Some(((term, fid), tf)) = terms.next() {
             let mut fields = vec![(fid, tf)];
-            while terms.peek().map_or(false, |((t, _), _)| *t == term) {
+            while terms.peek().is_some_and(|((t, _), _)| *t == term) {
                 let ((_, fid), tf) = terms.next().unwrap();
                 fields.push((fid, tf));
             }
@@ -1323,7 +1321,7 @@ impl Segment {
             let off = u64::from_le_bytes(e[0..8].try_into().unwrap()) as usize;
             let len = u64::from_le_bytes(e[8..16].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(e[16..20].try_into().unwrap());
-            if off.checked_add(len).map_or(true, |end| end > size - FOOTER_LEN) {
+            if off.checked_add(len).is_none_or(|end| end > size - FOOTER_LEN) {
                 return Err(bad("section out of bounds"));
             }
             // Document blocks carry their own checksum and are verified on read.

@@ -267,7 +267,7 @@ impl TaskStore {
             compact.extend_from_slice(&serde_json::to_vec(task)?);
             compact.push(b'\n');
         }
-        atomic_write(&self.path, &compact).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        atomic_write(&self.path, &compact).map_err(|e| std::io::Error::other(e.to_string()))?;
         self.log = OpenOptions::new().create(true).append(true).open(&self.path)?;
         self.log_bytes = compact.len() as u64;
         self.compact_at = (self.log_bytes * 2).max(LOG_COMPACT_BYTES);
@@ -293,7 +293,7 @@ impl Tenant {
         std::fs::create_dir_all(dir.join("payloads"))?;
         // Uploads that were still being received when the process stopped.
         for entry in std::fs::read_dir(dir.join("payloads"))?.flatten() {
-            if entry.path().extension().map_or(false, |e| e == "upload") {
+            if entry.path().extension().is_some_and(|e| e == "upload") {
                 let _ = std::fs::remove_file(entry.path());
             }
         }

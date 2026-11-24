@@ -2,9 +2,11 @@
 
 Thanks for your interest. Trailhound is at an early stage, so the most useful contributions right now are bug reports with a way to reproduce them, and compatibility gaps with the Meilisearch API.
 
+If you want to write code, the [roadmap](ROADMAP.md) lists what is wanted and what is out of scope, and [ARCHITECTURE.md](ARCHITECTURE.md) explains how the code is organized and where each kind of change goes. For anything larger than a bug fix, open an issue before you start.
+
 ## Reporting a bug
 
-Open an issue with:
+Open an issue with the bug report form, or the compatibility form when Trailhound answers differently from Meilisearch. Both ask for:
 
 - the Trailhound version (`GET /version`) and how you run it (binary, Docker, operating system);
 - the requests that show the problem, ideally as `curl` commands with a small set of documents;
@@ -19,7 +21,10 @@ You need a stable Rust toolchain. Node 20 or later is only needed for the SDK te
 ```sh
 cargo build --release
 cargo test --release                 # engine tests
+cargo clippy --all-targets -- -D warnings
 ```
+
+CI runs clippy with warnings as errors. It does not check formatting: the code is not formatted with `rustfmt`, so please do not run `cargo fmt` over files you touch; keep the style of the code around your change.
 
 SDK compatibility test (34 checks with the official `meilisearch-js`), against a running server:
 

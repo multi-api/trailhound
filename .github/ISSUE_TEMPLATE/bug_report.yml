@@ -1,0 +1,71 @@
+name: Bug report
+description: Something crashes, returns an error it should not, or loses or corrupts data.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. A report we can reproduce gets fixed much faster, so the most useful thing here is the exact requests.
+
+        If Trailhound answers differently from Meilisearch but nothing is broken, use the **Compatibility gap** form instead. Security problems go through a [private report](https://github.com/multi-api/trailhound/security/advisories/new), not an issue.
+  - type: input
+    id: version
+    attributes:
+      label: Trailhound version
+      description: The `engine` field of `GET /version`, or the image tag.
+      placeholder: trailhound 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you run it
+      options:
+        - Docker image
+        - Release binary
+        - cargo install
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: Ubuntu 24.04 on ARM64, 512 MB of memory
+    validations:
+      required: true
+  - type: textarea
+    id: requests
+    attributes:
+      label: Requests that show the problem
+      description: As `curl` commands, starting from an empty index, with the smallest set of documents and settings that still shows it. Remove your keys.
+      render: sh
+      placeholder: |
+        curl -X POST "http://127.0.0.1:7700/indexes/books/documents?primaryKey=id" \
+          -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+          -d '[{"id": 1, "title": "Ficciones"}]'
+
+        curl -X POST http://127.0.0.1:7700/indexes/books/search \
+          -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+          -d '{"q": "ficiones"}'
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What you got
+      description: The response body and status code. For a failed write, the task from `GET /tasks/{taskUid}`. For a crash, the server's output.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Number of documents and tenants, memory limit, flags and environment variables, whether it happens every time.

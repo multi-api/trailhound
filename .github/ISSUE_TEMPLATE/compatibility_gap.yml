@@ -1,0 +1,59 @@
+name: Compatibility gap with Meilisearch
+description: A request, parameter, setting or SDK call that works on Meilisearch and is missing or answers differently here.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Trailhound aims to be a drop-in for the parts of the Meilisearch API it implements. Reports like this one decide what gets implemented next.
+
+        Check [What is missing](https://github.com/multi-api/trailhound#what-is-missing) and the [roadmap](https://github.com/multi-api/trailhound/blob/main/ROADMAP.md) first: if the feature is listed there, a comment on its issue saying you need it, and for what, is more useful than a new report.
+  - type: input
+    id: version
+    attributes:
+      label: Trailhound version
+      description: The `engine` field of `GET /version`, or the image tag.
+      placeholder: trailhound 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: meilisearch
+    attributes:
+      label: Meilisearch version you compared with
+      placeholder: "1.58.0"
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: SDK or client, and its version
+      description: Leave empty if you used plain HTTP.
+      placeholder: meilisearch-php 1.16, Laravel Scout 10
+  - type: textarea
+    id: requests
+    attributes:
+      label: Requests
+      description: As `curl` commands that can be run against both servers, starting from an empty index, with the documents and settings needed. If the problem shows up through an SDK, add the SDK call too.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: meilisearch-answer
+    attributes:
+      label: What Meilisearch answers
+      description: Status code and body.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: trailhound-answer
+    attributes:
+      label: What Trailhound answers
+      description: Status code and body.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: What this blocks for you
+      description: For example "Scout's import command fails" or "results come back in a different order". It helps us order the work.
