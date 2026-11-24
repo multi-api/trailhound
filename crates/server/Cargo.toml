@@ -5,9 +5,12 @@ edition = "2021"
 license = "MIT"
 authors = ["Multi API SpA"]
 description = "Low-memory, multi-tenant search server with a Meilisearch-compatible API."
+readme = "../../README.md"
+keywords = ["search", "search-engine", "full-text", "meilisearch", "multi-tenant"]
+categories = ["database-implementations", "web-programming::http-server"]
 
 [dependencies]
-trailhound-engine = { path = "../engine" }
+trailhound-engine = { path = "../engine", version = "0.1.0" }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "fs", "io-util"] }
 http-body-util = "0.1"
