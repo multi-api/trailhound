@@ -76,7 +76,7 @@ impl Auth {
         let Some(key) = &self.key else { return Ok(()) };
         let group = action.split('.').next().unwrap_or("");
         let action_ok = key.actions.iter().any(|a| a == "*" || a == action || a.strip_suffix(".*") == Some(group));
-        let index_ok = index.map_or(true, |uid| key.indexes.iter().any(|p| p == "*" || p == uid || p.strip_suffix('*').map_or(false, |pre| uid.starts_with(pre))));
+        let index_ok = index.is_none_or(|uid| key.indexes.iter().any(|p| p == "*" || p == uid || p.strip_suffix('*').is_some_and(|pre| uid.starts_with(pre))));
         if action_ok && index_ok {
             Ok(())
         } else {
@@ -85,7 +85,7 @@ impl Auth {
     }
 
     fn allows_index(&self, uid: &str) -> bool {
-        self.key.as_ref().map_or(true, |k| k.indexes.iter().any(|p| p == "*" || p == uid || p.strip_suffix('*').map_or(false, |pre| uid.starts_with(pre))))
+        self.key.as_ref().is_none_or(|k| k.indexes.iter().any(|p| p == "*" || p == uid || p.strip_suffix('*').is_some_and(|pre| uid.starts_with(pre))))
     }
 }
 
@@ -662,7 +662,7 @@ async fn get_task(auth: Auth, Path(uid): Path<u64>) -> R {
     auth.check("tasks.get", None)?;
     match auth.tenant.tasks.lock().unwrap().tasks.get(&uid) {
         // A key limited to some indexes sees only their tasks, as in the list.
-        Some(t) if t.index_uid.as_ref().map_or(true, |u| auth.allows_index(u)) => ok(t.view()),
+        Some(t) if t.index_uid.as_ref().is_none_or(|u| auth.allows_index(u)) => ok(t.view()),
         _ => Err(ApiError::not_found("task_not_found", format!("Task `{uid}` not found."))),
     }
 }
@@ -678,14 +678,14 @@ async fn list_keys(auth: Auth, Query(params): Params) -> R {
 /// Accepts a date, or a date and time separated by `T` or a space, in UTC.
 fn expiry(text: &str) -> Option<String> {
     let text = text.trim().trim_end_matches('Z');
-    let (date, time) = match text.split_once(|c| c == 'T' || c == ' ') {
+    let (date, time) = match text.split_once(['T', ' ']) {
         Some((d, t)) => (d, t.split('.').next().unwrap_or(t)),
         None => (text, "00:00:00"),
     };
     let numbers = |s: &str, sep: char, widths: &[usize], max: &[u32]| {
         let parts: Vec<&str> = s.split(sep).collect();
         parts.len() == widths.len()
-            && parts.iter().zip(widths).zip(max).all(|((p, w), m)| p.len() == *w && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u32>().map_or(false, |n| n <= *m))
+            && parts.iter().zip(widths).zip(max).all(|((p, w), m)| p.len() == *w && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u32>().is_ok_and(|n| n <= *m))
     };
     (numbers(date, '-', &[4, 2, 2], &[9999, 12, 31]) && numbers(time, ':', &[2, 2, 2], &[23, 59, 59])).then(|| format!("{date}T{time}Z"))
 }

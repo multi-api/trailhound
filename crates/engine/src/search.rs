@@ -108,7 +108,7 @@ fn phrase_docs(seg: &Segment, phrase: &[String], cands: &RoaringBitmap, allowed:
         }
     }
     for (fid, first_docs, _) in &lists[0] {
-        if allowed.map_or(false, |a| !a.contains(fid)) {
+        if allowed.is_some_and(|a| !a.contains(fid)) {
             continue;
         }
         let mut docs = cands & first_docs;
@@ -232,7 +232,7 @@ fn word_hits(seg: &Segment, word: &QWord, lev: Option<&Typos>, settings: &Settin
     for (off, typos) in derivs {
         hits.terms.push(off);
         for (fid, bm, _) in seg.postings(off)? {
-            if allowed.map_or(false, |a| !a.contains(&fid)) {
+            if allowed.is_some_and(|a| !a.contains(&fid)) {
                 continue;
             }
             if exact_term == Some(off) {
@@ -616,7 +616,7 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
                     let mut found = Vec::new();
                     for off in &w[s].terms {
                         for (fid, docs, pos_off) in seg.postings(*off)? {
-                            if ctx.allowed.as_ref().map_or(false, |a| !a.contains(&fid)) || docs.is_disjoint(&cands[s]) {
+                            if ctx.allowed.as_ref().is_some_and(|a| !a.contains(&fid)) || docs.is_disjoint(&cands[s]) {
                                 continue;
                             }
                             seg.scan_positions(pos_off, &docs, &want, |w, p| found.push((want[w], fid, p)))?;
@@ -727,7 +727,7 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
                     let mut best = vec![POSITION_MAX_COST; size];
                     for off in &w[s].terms {
                         for (fid, docs, pos_off) in seg.postings(*off)? {
-                            if ctx.allowed.as_ref().map_or(false, |a| !a.contains(&fid)) || docs.is_disjoint(&cands[s]) {
+                            if ctx.allowed.as_ref().is_some_and(|a| !a.contains(&fid)) || docs.is_disjoint(&cands[s]) {
                                 continue;
                             }
                             seg.scan_positions(pos_off, &docs, &want, |idx, p| {
@@ -787,7 +787,7 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
                         let wanted = bucketed_position(i as u32);
                         let mut placed = vec![false; want.len()];
                         for (fid, docs, pos_off) in seg.postings(off)? {
-                            if ctx.allowed.as_ref().map_or(false, |a| !a.contains(&fid)) {
+                            if ctx.allowed.as_ref().is_some_and(|a| !a.contains(&fid)) {
                                 continue;
                             }
                             seg.scan_positions(pos_off, &docs, &want, |idx, p| {
@@ -934,7 +934,7 @@ fn facet_distribution(st: &State, cands: &Cands, facets: &[String]) -> Result<(V
                 })?;
             }
         }
-        let by_count = settings.faceting.sort_facet_values_by.get(&name).or_else(|| settings.faceting.sort_facet_values_by.get("*")).map_or(false, |v| v == "count");
+        let by_count = settings.faceting.sort_facet_values_by.get(&name).or_else(|| settings.faceting.sort_facet_values_by.get("*")).is_some_and(|v| v == "count");
         let mut entries: Vec<(String, u64)> = counts.into_iter().collect();
         if by_count {
             entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));

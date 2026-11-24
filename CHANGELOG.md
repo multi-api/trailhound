@@ -10,6 +10,9 @@ Compatibility with the official Meilisearch clients for Python, Go and PHP and w
 - `fieldDistribution` in the index and global stats counts only live documents. It used to include deleted and replaced documents until their segment was merged.
 - `GET /tasks` accepts the `uids`, `canceledBy`, `reverse`, `beforeEnqueuedAt`, `afterEnqueuedAt`, `beforeStartedAt`, `afterStartedAt`, `beforeFinishedAt` and `afterFinishedAt` parameters, and `*` in the list filters. They were ignored, so a client asking for some tasks got all of them. An invalid `from`, uid or date is now a `400` instead of being ignored.
 
+- Roadmap, architecture document, issue forms and a pull request template.
+- CI runs clippy with warnings as errors.
+
 ## 0.1.0 — 2026-11-24
 
 First public version.

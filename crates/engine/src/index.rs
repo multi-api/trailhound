@@ -119,12 +119,15 @@ pub struct IndexStats {
     pub segments: usize,
 }
 
+/// A field distribution and the snapshot it was computed from.
+type Distribution = (Weak<State>, BTreeMap<String, u64>);
+
 pub struct Index {
     dir: PathBuf,
     state: RwLock<Arc<State>>,
     wlock: Mutex<()>,
     /// The field distribution of one snapshot, kept until the index changes.
-    distribution: Mutex<Option<(Weak<State>, BTreeMap<String, u64>)>>,
+    distribution: Mutex<Option<Distribution>>,
 }
 
 fn seg_path(dir: &Path, id: u64) -> PathBuf {
@@ -252,13 +255,13 @@ impl Writer {
 
     /// Whether the unfinished segment holds a live document with this id.
     fn in_current(&self, id: &str) -> bool {
-        self.cur.as_ref().map_or(false, |(_, b, del)| b.pk_lookup(id).map_or(false, |d| !del.contains(d)))
+        self.cur.as_ref().is_some_and(|(_, b, del)| b.pk_lookup(id).is_some_and(|d| !del.contains(d)))
     }
 
     /// Mark a document of the unfinished segment as superseded.
     fn drop_from_current(&mut self, id: &str) -> bool {
         match self.cur.as_mut() {
-            Some((_, b, del)) => b.pk_lookup(id).map_or(false, |d| del.insert(d)),
+            Some((_, b, del)) => b.pk_lookup(id).is_some_and(|d| del.insert(d)),
             None => false,
         }
     }
@@ -508,7 +511,7 @@ impl Index {
         let result = (|| -> Result<()> {
             let mut current: Option<Arc<Schema>> = None;
             for job in rx.iter() {
-                if current.as_ref().map_or(false, |c| !Arc::ptr_eq(c, &job.schema)) {
+                if current.as_ref().is_some_and(|c| !Arc::ptr_eq(c, &job.schema)) {
                     writer.schema = (*job.schema).clone();
                 }
                 current = Some(job.schema);
