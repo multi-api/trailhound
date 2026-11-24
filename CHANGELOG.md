@@ -2,7 +2,7 @@
 
 All notable changes to Trailhound are recorded here. The project follows [semantic versioning](https://semver.org); before 1.0, minor versions may change the API and the on-disk format.
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-11-24
 
 First public version.
 
