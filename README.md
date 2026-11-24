@@ -33,14 +33,14 @@ Trailhound is an independent implementation and is not affiliated with Meilisear
 
 ## Quick start
 
-With Docker:
+With Docker, using the published image (x86-64 and ARM64):
 
 ```sh
-git clone https://github.com/multi-api/trailhound
-cd trailhound
-docker compose up -d --build
+docker run -d --name trailhound -p 127.0.0.1:7700:7700 -v trailhound-data:/data ghcr.io/multi-api/trailhound:0.1.0
 docker exec trailhound cat /data/platform.json     # shows the admin key
 ```
+
+The repository also has a `docker-compose.yml` that builds the image from source: `docker compose up -d --build`.
 
 Or download a binary for Linux (x86-64 and ARM64), macOS (Apple silicon) or Windows from the [latest release](https://github.com/multi-api/trailhound/releases/latest), unpack it and run it:
 
@@ -154,12 +154,12 @@ A checklist first; the details follow.
 
 ### Docker
 
-`docker-compose.yml` in this repository is a working starting point: it binds the port to `127.0.0.1` only, keeps the data in a named volume, restarts the server unless stopped, limits it to 256 MB of memory and runs as an unprivileged user. Set the admin key in an `.env` file or your orchestrator's secrets rather than in the file itself:
+This Compose file is a working starting point: it binds the port to `127.0.0.1` only, keeps the data in a named volume, restarts the server unless stopped, limits it to 256 MB of memory and runs as an unprivileged user. Set the admin key in an `.env` file or your orchestrator's secrets rather than in the file itself:
 
 ```yaml
 services:
   trailhound:
-    build: .
+    image: ghcr.io/multi-api/trailhound:0.1.0
     restart: unless-stopped
     ports:
       - "127.0.0.1:7700:7700"
