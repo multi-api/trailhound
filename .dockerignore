@@ -1,0 +1,5 @@
+target
+data
+data-test
+tests
+**/node_modules

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trailhound · Brand guide</title>
+<link rel="icon" href="trailhound-icon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="tokens.css">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--th-snow); color: var(--th-ink); font: 16px/1.55 var(--th-font-body); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 20px; }
+  .hero { background: var(--th-night); color: var(--th-night-text); padding: 72px 0 64px; }
+  .hero img { width: min(420px, 80%); display: block; }
+  .hero p { font: 500 clamp(20px, 3vw, 28px)/1.25 var(--th-font-heading); margin: 28px 0 0; max-width: 22ch; color: var(--th-trail-light); }
+  .hero small { display: block; margin-top: 14px; color: var(--th-night-muted); font-size: 15px; max-width: 56ch; }
+  section { padding: 56px 0 8px; }
+  h2 { font: 700 30px/1.1 var(--th-font-heading); letter-spacing: -.02em; margin: 0 0 6px; }
+  h3 { font: 700 17px/1.2 var(--th-font-heading); margin: 28px 0 8px; }
+  .lead { color: var(--th-muted); margin: 0 0 24px; max-width: 64ch; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .box { background: var(--th-paper); border: 1px solid var(--th-line); border-radius: var(--th-radius); padding: 28px; display: flex; align-items: center; justify-content: center; min-height: 180px; }
+  .box.dark { background: var(--th-night); border-color: var(--th-night); }
+  .box img { max-width: 100%; height: 72px; }
+  .box img.mark { height: 110px; }
+  figure { margin: 0; }
+  figcaption { font-size: 13px; color: var(--th-muted); margin-top: 8px; }
+  .sizes { display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap; }
+  .sizes div { text-align: center; font-size: 12px; color: var(--th-muted); }
+  .sizes img { display: block; margin: 0 auto 6px; }
+  .sw { border-radius: var(--th-radius); overflow: hidden; border: 1px solid var(--th-line); background: var(--th-paper); }
+  .sw i { display: block; height: 84px; }
+  .sw div { padding: 10px 12px 12px; font-size: 13px; }
+  .sw b { display: block; font: 700 15px var(--th-font-heading); }
+  .sw code { font: 12px var(--th-font-mono); color: var(--th-muted); }
+  .type { background: var(--th-paper); border: 1px solid var(--th-line); border-radius: var(--th-radius); padding: 22px 24px; margin-bottom: 14px; }
+  .type span { font-size: 12px; color: var(--th-muted); text-transform: uppercase; letter-spacing: .06em; }
+  .t1 { font: 700 40px/1.05 var(--th-font-heading); letter-spacing: -.025em; margin: 6px 0 0; }
+  .t2 { font: 400 17px/1.55 var(--th-font-body); margin: 6px 0 0; max-width: 60ch; }
+  .t3 { font: 400 14px/1.6 var(--th-font-mono); margin: 6px 0 0; white-space: pre-wrap; }
+  table { width: 100%; border-collapse: collapse; background: var(--th-paper); border: 1px solid var(--th-line); border-radius: var(--th-radius); overflow: hidden; }
+  th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--th-line); vertical-align: top; font-size: 15px; }
+  th { font: 600 12px var(--th-font-body); text-transform: uppercase; letter-spacing: .06em; color: var(--th-muted); }
+  tr:last-child td { border-bottom: 0; }
+  .yes { color: var(--th-moss); font-weight: 600; } .no { color: var(--th-clay); font-weight: 600; }
+  ul { padding-left: 20px; margin: 0; } li { margin: 6px 0; }
+  .ui { background: var(--th-paper); border: 1px solid var(--th-line); border-radius: var(--th-radius); overflow: hidden; }
+  .ui header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--th-line); }
+  .ui header img { height: 26px; } .ui header span { color: var(--th-muted); font-size: 14px; flex: 1; }
+  .ui .body { padding: 18px 16px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .btn { font: 600 14px var(--th-font-body); border-radius: 7px; padding: 8px 14px; border: 1px solid var(--th-line); background: var(--th-paper); color: var(--th-ink); }
+  .btn.p { background: var(--th-trail-text); border-color: var(--th-trail-text); color: #fff; }
+  .btn.d { color: var(--th-clay); }
+  .pill { font-size: 12px; border: 1px solid var(--th-moss); color: var(--th-moss); border-radius: 99px; padding: 1px 9px; }
+  footer { padding: 48px 0 64px; color: var(--th-muted); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<div class="hero"><div class="wrap">
+  <img src="trailhound-logo-light.svg" alt="Trailhound">
+  <p>Search that stays on the trail.</p>
+  <small>A low-memory search engine with a Meilisearch-compatible API. This guide defines how it looks and how it speaks.</small>
+</div></div>
+
+<div class="wrap">
+
+<section>
+  <h2>The idea</h2>
+  <p class="lead">A hound finds what it is after with very little: it picks up a trail and does not let go. That is the product: it finds fast, takes little room and loses no data. The brand is plain and direct, with one warm accent on neutral surfaces.</p>
+</section>
+
+<section>
+  <h2>Symbol</h2>
+  <p class="lead">The head of a hound in profile, reduced to three shapes: head, ear and eye. The ear carries the accent colour and is the feature that identifies it.</p>
+  <div class="grid">
+    <figure><div class="box"><img class="mark" src="trailhound-symbol.svg" alt=""></div><figcaption>On light · <code>trailhound-symbol.svg</code></figcaption></figure>
+    <figure><div class="box dark"><img class="mark" src="trailhound-symbol-light.svg" alt=""></div><figcaption>On dark · <code>trailhound-symbol-light.svg</code></figcaption></figure>
+    <figure><div class="box"><img class="mark" src="trailhound-icon.svg" alt=""></div><figcaption>App icon and favicon · <code>trailhound-icon.svg</code></figcaption></figure>
+  </div>
+  <h3>Sizes</h3>
+  <div class="box" style="min-height:0"><div class="sizes">
+    <div><img src="trailhound-icon.svg" width="64" alt="">64</div>
+    <div><img src="trailhound-icon.svg" width="32" alt="">32</div>
+    <div><img src="trailhound-icon.svg" width="16" alt="">16</div>
+    <div><img src="trailhound-symbol.svg" width="64" alt="">64</div>
+    <div><img src="trailhound-symbol.svg" width="32" alt="">32</div>
+    <div><img src="trailhound-symbol.svg" width="20" alt="">20 (minimum)</div>
+  </div></div>
+</section>
+
+<section>
+  <h2>Logo</h2>
+  <p class="lead">Symbol and name in lowercase, set in Space Grotesk Bold. In running text the name is written "Trailhound", with a capital T.</p>
+  <div class="grid">
+    <figure><div class="box"><img src="trailhound-logo.svg" alt="Trailhound"></div><figcaption>Primary · <code>trailhound-logo.svg</code></figcaption></figure>
+    <figure><div class="box dark"><img src="trailhound-logo-light.svg" alt="Trailhound"></div><figcaption>On dark · <code>trailhound-logo-light.svg</code></figcaption></figure>
+  </div>
+  <h3>Usage rules</h3>
+  <ul>
+    <li>Leave clear space around it equal to the width of the ear.</li>
+    <li>The symbol is ink with an orange ear, or snow with a light-orange ear. Do not recolour it.</li>
+    <li>Do not rotate it, distort it, or add a shadow or outline.</li>
+    <li>On photos or backgrounds other than snow, ink or trail, use the icon with its own background.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Colour</h2>
+  <p class="lead">Three colours do nearly all the work: ink, snow and trail. The rest are supporting colours. The values live in <code>tokens.css</code>.</p>
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+    <div class="sw"><i style="background:#171717"></i><div><b>Ink</b><code>#171717</code><br>Text, symbol, dark background</div></div>
+    <div class="sw"><i style="background:#FAFAFA"></i><div><b>Snow</b><code>#FAFAFA</code><br>Light background</div></div>
+    <div class="sw"><i style="background:#D9652B"></i><div><b>Trail</b><code>#D9652B</code><br>Accent in charts and icons</div></div>
+    <div class="sw"><i style="background:#A8440F"></i><div><b>Trail text</b><code>#A8440F</code><br>Links and buttons on light</div></div>
+    <div class="sw"><i style="background:#F08A4B"></i><div><b>Trail light</b><code>#F08A4B</code><br>Accent on dark</div></div>
+    <div class="sw"><i style="background:#A1A1AA"></i><div><b>Stone</b><code>#A1A1AA</code><br>Secondary, illustration</div></div>
+    <div class="sw"><i style="background:#2F5D50"></i><div><b>Moss</b><code>#2F5D50</code><br>Success state</div></div>
+    <div class="sw"><i style="background:#B3261E"></i><div><b>Clay</b><code>#B3261E</code><br>Error, destructive action</div></div>
+  </div>
+  <h3>Contrast</h3>
+  <ul>
+    <li>Trail (<code>#D9652B</code>) on snow does not reach text contrast: use it for shapes, not for small type.</li>
+    <li>For accent text and buttons on light, use Trail text (<code>#A8440F</code>) with white type.</li>
+    <li>On dark, the accent is Trail light (<code>#F08A4B</code>) with ink type.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Typography</h2>
+  <p class="lead">Three open-licence (OFL) families. The admin panel uses system fonts so that self-hosted installs load nothing external.</p>
+  <div class="type"><span>Headings · Space Grotesk 700</span><p class="t1">Eight tenants in under 100 MB.</p></div>
+  <div class="type"><span>Body · Inter 400 / 600</span><p class="t2">Trailhound keeps documents compressed on disk and brings into memory only what a search needs. It returns exactly the bytes it received.</p></div>
+  <div class="type"><span>Code · JetBrains Mono</span><p class="t3">curl -X POST localhost:7700/indexes/books/search \
+  -H "Authorization: Bearer $KEY" -d '{"q": "garsia marques"}'</p></div>
+</section>
+
+<section>
+  <h2>Voice</h2>
+  <p class="lead">Trailhound speaks like an engineer who measured before giving an opinion: direct, concrete and unadorned.</p>
+  <table>
+    <tr><th>Principle</th><th class="yes">Like this</th><th class="no">Not like this</th></tr>
+    <tr><td>Measured numbers, with their conditions</td><td>"63 MB on disk for 300,000 documents; Meilisearch uses 598 MB for the same data."</td><td>"Up to 10× more efficient."</td></tr>
+    <tr><td>Say what is missing</td><td>"Meilisearch uses less CPU per query. We are working on it."</td><td>"World-class performance."</td></tr>
+    <tr><td>Short sentences, verb first</td><td>"Create an index. Send documents. Search."</td><td>"Our platform empowers you to leverage…"</td></tr>
+    <tr><td>The dog shows up rarely</td><td>One reference to the trail in the tagline and in empty states.</td><td>Dog puns in every error message.</td></tr>
+  </table>
+  <h3>Taglines</h3>
+  <ul>
+    <li><b>English:</b> Search that stays on the trail.</li>
+    <li><b>Spanish:</b> Búsqueda que no pierde el rastro.</li>
+    <li><b>Descriptor:</b> A low-memory search engine with a Meilisearch-compatible API.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>In use</h2>
+  <p class="lead">How it looks in the interface: snow background, paper cards, one accent button per view.</p>
+  <div class="ui">
+    <header><img src="trailhound-logo.svg" alt="Trailhound"><span>Administration</span><button class="btn">Sign out</button></header>
+    <div class="body"><button class="btn p">New tenant</button><button class="btn">View keys</button><button class="btn d">Delete</button><span class="pill">active</span></div>
+  </div>
+</section>
+
+<footer>Trailhound · Brand guide v1 · Files in this folder: symbol, logo, icon and <code>tokens.css</code>. The logo's name is live text in Space Grotesk; convert it to outlines before printing or registering the mark.</footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,19 @@
+services:
+  trailhound:
+    build: .
+    image: trailhound:0.1.0
+    container_name: trailhound
+    restart: unless-stopped
+    # Only reachable from this machine. Put a TLS proxy in front to expose it.
+    ports:
+      - "127.0.0.1:7700:7700"
+    volumes:
+      - trailhound-data:/data
+    mem_limit: 256m
+    # environment:
+    #   TRAILHOUND_ADMIN_KEY: choose-a-long-random-key      # otherwise one is generated and printed on first start
+    #   TRAILHOUND_INDEXING_THREADS: "4"
+    #   TRAILHOUND_INDEXING_MEMORY_MB: "24"
+
+volumes:
+  trailhound-data:

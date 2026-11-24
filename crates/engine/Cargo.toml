@@ -1,0 +1,23 @@
+[package]
+name = "trailhound-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Multi API SpA"]
+description = "Low-memory, multi-tenant search engine core used by Trailhound."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+fst = { version = "0.4", features = ["levenshtein"] }
+roaring = "0.10"
+memmap2 = "0.9"
+zstd = "0.13"
+crc32fast = "1"
+thiserror = "1"
+unicode-normalization = "0.1"
+base64 = "0.22"
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,7 @@
+{
+  "name": "trailhound-sdk-compat",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node compat.mjs" },
+  "dependencies": { "meilisearch": "0.63.0" }
+}

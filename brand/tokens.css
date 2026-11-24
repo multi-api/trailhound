@@ -1,0 +1,25 @@
+/* Trailhound: colours and typography. Single source for the panel, the website and the docs. */
+:root {
+  --th-ink: #171717;          /* text, symbol */
+  --th-snow: #FAFAFA;         /* light background */
+  --th-paper: #FFFFFF;        /* cards on snow */
+  --th-trail: #D9652B;        /* accent: charts, icons, large button fills */
+  --th-trail-text: #A8440F;   /* accent for text and buttons on light backgrounds (AA contrast) */
+  --th-trail-light: #F08A4B;  /* accent on dark backgrounds */
+  --th-stone: #A1A1AA;        /* neutral secondary */
+  --th-moss: #2F5D50;         /* success states */
+  --th-clay: #B3261E;         /* errors and destructive actions */
+  --th-line: #E5E5E7;         /* borders on light */
+  --th-muted: #6B6B70;        /* secondary text on light */
+
+  --th-night: #171717;        /* dark background */
+  --th-night-paper: #18181A;
+  --th-night-line: #2E2E32;
+  --th-night-text: #F5F5F5;
+  --th-night-muted: #A1A1AA;
+
+  --th-font-heading: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --th-font-body: Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
+  --th-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+  --th-radius: 10px;
+}

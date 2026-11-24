@@ -1,0 +1,20 @@
+[package]
+name = "trailhound"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Multi API SpA"]
+description = "Low-memory, multi-tenant search server with a Meilisearch-compatible API."
+
+[dependencies]
+trailhound-engine = { path = "../engine" }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "fs", "io-util"] }
+http-body-util = "0.1"
+tower-http = { version = "0.5", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
