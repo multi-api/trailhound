@@ -8,7 +8,7 @@
 
 Trailhound gives you typo-tolerant, filterable, sortable full-text search over JSON documents. It speaks the Meilisearch HTTP API, so the official Meilisearch SDKs work against it, and it is built for one thing Meilisearch is not: running many customers on a small machine.
 
-- **Small.** Indexes live on disk in memory-mapped files. Eight tenants with 300,000 documents between them are served in about 100 MB of RAM and 72 MB of disk; the same data in Meilisearch takes about 1 GB of RAM and 550 MB of disk. ([Measurements](#comparison-with-meilisearch-1580))
+- **Small.** Indexes live on disk in memory-mapped files. One million Wikipedia articles are indexed in 224 MB of RAM and kept in 660 MB of disk, where Meilisearch needs 7 GB of RAM and 6.5 GB of disk; at rest the server holds 9 MB. The price is speed: on the same data Meilisearch answers two to five times as many searches, with a much better latency tail. ([Measurements](#comparison-with-meilisearch-1580))
 - **Multi-tenant.** One server holds many isolated tenants, each with its own indexes, API keys, quotas and usage counters.
 - **Compatible.** Indexes, documents, search, settings, tasks and keys follow the Meilisearch API, and results are ranked by the same rules in the same order.
 - **Careful with data.** Documents come back byte for byte as they went in, every block on disk is checksummed, and writes survive a crash or power cut.
@@ -293,16 +293,16 @@ The server answers CORS requests from any origin, which is what lets a browser s
 
 ### Sizing
 
-These figures come from the benchmarks below, with synthetic documents of about 320 bytes each; measure with your own data.
+These figures come from the benchmarks below, on English Wikipedia (the opening of each article, about 800 bytes a document) and on synthetic documents of about 320 bytes; measure with your own data.
 
 | Resource | What to expect |
 | --- | --- |
-| Memory | 45 MB at rest and about 100 MB under load for 300,000 documents in 8 tenants. Indexing peaks at about 95 MB. A 256 MB limit leaves room; the simulated 512 MB, 2-vCPU machine ran it comfortably |
-| Disk | About two thirds of the size of the documents as NDJSON (63 MB for 95 MB). Leave free space for merges, which rewrite the segments they join |
-| CPU | Searches use one thread each when several run at once. About 1,100 queries per second per core on x86 for the benchmark's query mix |
+| Memory | About 10 MB at rest whatever the size of the index, and the process's own memory stays in the tens of megabytes under load. On top of that come the pages of the index that searches touch, which the system keeps while it has room: 300 to 750 MB for 1 million articles under load, up to 1.9 GB for 6.4 million. Under a 512 MB limit both sizes were indexed and served, the larger one slowly |
+| Disk | About 80% of the size of the documents as NDJSON for real text (660 MB for 800 MB), two thirds for the synthetic documents. Leave free space for merges, which rewrite the segments they join |
+| CPU | Searches use one thread each when several run at once, and their cost grows with the index. On x86, for the benchmarks' query mixes: about 1,100 queries per second per core on eight tenants of 37,500 synthetic documents, about 150 on eight tenants of 125,000 articles, and about 10 on one index of 6.4 million |
 | Indexing memory | `TRAILHOUND_INDEXING_MEMORY_MB` (default 24) caps the index under construction. Raise it for faster bulk loads, lower it on very small machines |
 
-Memory use depends on what is being searched, not on how much is stored: index files are memory-mapped and the operating system keeps in memory only the pages in use.
+Memory use depends on what is being searched more than on how much is stored: index files are memory-mapped and the operating system keeps in memory only the pages in use, and takes them back when something else needs the room. With less memory than index, searches wait for the disk.
 
 ### Data folder and backups
 
@@ -404,9 +404,11 @@ Known differences and rough edges:
 - With many ties, tied documents come out in a different order than in Meilisearch.
 - A search keeps running on the server after its client disconnects.
 - The `proximity` and `wordPosition` rules are skipped for groups of more than 100,000 tied candidates.
+- A query word is matched against at most 300 terms of each segment's dictionary (its typos and, for the last word, the terms it is a prefix of). A short prefix of a common word therefore counts fewer matches than Meilisearch and can miss documents that would rank first.
+- Symbols such as `$`, `=`, `<` and `|` separate words and nothing more; Meilisearch appears to give them a position of their own, which changes `proximity` around them.
 - The `distinctAttribute` setting and the `distinct` search parameter are accepted and stored, but not applied: no error is returned.
 - When merging, the sort columns of the resulting segment are built in memory (8 bytes per document and numeric field; one string per document for text fields).
-- Opening a segment verifies the checksum of all its sections, which reads the whole file on start.
+- Opening a segment verifies the checksum of all its sections, which reads the whole file on start: one to two seconds for a 4 GB index that is not in the system's cache.
 
 ## How it works
 
@@ -418,51 +420,182 @@ A summary; [ARCHITECTURE.md](ARCHITECTURE.md) has the file format, the write and
 - **Crash safety** (`crates/engine/src/index.rs`, `crates/server/src/platform.rs`): a write creates new files, calls `fsync` and replaces the manifest with an atomic `rename`. Tasks are recorded on disk before the server answers `202`; unfinished ones are repeated on start and partial files are removed.
 - **Bounded memory while writing** (`crates/server/src/api.rs`, `crates/engine/src/index.rs`): the request body goes to disk as it arrives and documents are read 5,000 at a time. A segment under construction is closed when its in-memory index uses up its share of the budget (24 MB across all threads). Freed memory is returned to the system after each task.
 - **Parallel indexing**: the reading thread only extracts the primary key and assigns field ids; documents are routed by the hash of their key to the indexing threads, which each tokenize their share and build their own segments. A document always lands on the same thread, so the last version wins.
-- **Merging** (`segment::merge`): above 8 segments, the 5 smallest are merged without reindexing: documents are copied block by block and dictionaries are merged as sorted streams, dropping deleted documents. Merges under 400,000 documents copy the compressed blocks as they are; larger ones recompress at zstd level 19.
+- **Merging** (`segment::merge`): above 8 segments, the 5 smallest are merged without reindexing: documents are copied block by block and dictionaries are merged as sorted streams, dropping deleted documents. The compressed document blocks of a segment without deletions are copied as they are.
 - **Search** (`crates/engine/src/search.rs`): typo tolerance walks the dictionary with an automaton computed on the fly. Range filters use precomputed unions over spans of 64 and 4,096 values. A lone search spreads segments across cores; concurrent searches use one thread each.
 - **Stable memory** (`tune_allocator`): on Linux the server limits what glibc keeps after freeing. `TRAILHOUND_TRACE=1` prints the time spent in each phase of each search.
 
 ## Comparison with Meilisearch 1.58.0
 
-Measured on 2026-11-24 with 300,000 synthetic documents (95 MB of NDJSON, an 80-word vocabulary) on two machines: a 32-core x86 PC (WSL2 with Docker) and a Mac M1 Max (ARM, Docker with 8 CPUs and 4 GB). The scripts are in `tests/bench/`.
+Two sets of measurements, both taken on 2026-11-24 with the scripts in `tests/bench/`: English Wikipedia, at 1 million and 6.4 million articles, and the 300,000 synthetic documents the project started with. Short version of the real-text results: Trailhound indexes faster, in a fraction of the memory and of the disk, and runs in 512 MB where Meilisearch is killed while indexing; Meilisearch answers searches faster in every test, by more the larger the index, and its latency tail is far better.
 
-### Result order (`ranking.sh`)
+### Real text: English Wikipedia
 
-For 22 queries (one or several words, typos, prefixes, filters, sorting), Trailhound's top 10 hits are sent to Meilisearch to be scored. In all 22, the per-rule scores match those of Meilisearch's own top 10 position by position, both with the default `searchableAttributes` and with `["title", "description"]`. In 6 to 13 of them, depending on the configuration, the ids are identical too; in the rest, the only differences are documents tied on every rule.
+**Data.** The 2023-11-01 snapshot of English Wikipedia that Wikimedia publishes on Hugging Face (`wikimedia/wikipedia`, CC BY-SA 3.0 and GFDL), pinned to one revision. `tests/bench/wiki.sh` downloads it, checks the files against their published SHA-256 and writes one document per article: `id` (the page id), `title`, `url`, `text` and `length`. `text` is the opening of the article, whole paragraphs up to 1,000 characters; `length` is the size of the whole article in characters. Documents average 800 bytes of NDJSON.
 
-### One index, one client (`bench.sh`, x86)
+| Set | Articles | Download | NDJSON |
+| --- | --- | --- | --- |
+| `wiki.sh 1m` | the first 1,000,000 of 7 files spread over the snapshot | 2.2 GB | 0.8 GB |
+| `wiki.sh all` | all 6,407,814 | 11.6 GB | 5.1 GB |
+
+**Settings.** `searchableAttributes` is `["title", "text"]`, `length` is filterable and `length` and `title` are sortable; everything else is each engine's default. Both servers run in Docker with the same limit of 65,536 open files (with Docker's default of 1,024, Meilisearch fails on the larger set with "No file descriptors available").
+
+**Queries.** 100 search requests that `wiki.py` derives from the documents with a fixed seed, ten of each kind: one word of a title (`word`), a whole title of two to four words (`title`), two or three consecutive words of a text (`words`), a title with one letter dropped, swapped or replaced (`typo`), a title cut short in its last word (`prefix`), two consecutive words in quotes (`phrase`), three words of the same text with `matchingStrategy: all` (`all`), a word with a filter on `length` (`filter`), a word sorted by `length` or `title` (`sort`), and no words at all, a range of `length` sorted by `length` or `title` (`browse`). All ask for 10 hits and only the `id`. Each set has its own 100 queries, drawn from its own documents, so a kind of query is not word for word the same at the two sizes.
+
+**Machine.** A 32-core x86 PC with 31 GB of RAM and an NVMe disk, under WSL2 with Docker. There was no ARM run this time.
+
+```sh
+# On Linux with Docker, Python 3 and curl; the Linux binary goes in ~/trailhound-bench/target/release.
+bash tests/bench/wiki.sh 1m                                   # or: all
+DATASET=wiki-1m bash tests/bench/bench.sh
+DATASET=wiki-1m TENANTS=8 bash tests/bench/multitenant.sh     # or TENANTS=1; MEM=512m CPUS=0-1 for the small size
+DATASET=wiki-1m RANK_DOCS=1000000 bash tests/bench/ranking.sh
+```
+
+#### One index, one client (`bench.sh`)
+
+The documents go in as batches of 100,000. The search figures are over the 100 queries, each run 15 times, taking the median of each.
+
+| | 1 million: Trailhound | 1 million: Meilisearch | 6.4 million: Trailhound | 6.4 million: Meilisearch |
+| --- | --- | --- | --- | --- |
+| Indexing | 36 – 50 s | 108 – 120 s | 308 – 343 s | 658 – 852 s |
+| Peak memory while indexing | 224 MB | 6,995 MB | 950 MB | 21,961 MB |
+| Disk | 660 MB | 6,524 MB | 4,079 MB | 52,140 MB |
+| Start-up after a restart | 0.3 – 0.4 s | 0.4 – 0.7 s | 0.3 – 0.5 s | 0.5 – 0.9 s |
+| Start-up with an empty page cache | — | — | 1.0 – 2.3 s | 0.4 s |
+| Memory at rest after a restart | 9 MB | 78 MB | 9 MB | 77 MB |
+| Memory after the 1,500 searches | 288 MB | 941 – 954 MB | 778 MB | 1,248 MB |
+| of which the process's own (not file pages) | 14 MB | 124 MB | 12 MB | 259 MB |
+| Search: median of the 100 queries | 4.3 ms | 2.6 – 3.4 ms | 9.0 ms | 5.5 ms |
+| Search: 90th percentile of the 100 | 10.9 ms | 4.2 – 5.1 ms | 110 ms | 11.4 ms |
+| Search: slowest of the 100 | 25.8 ms | 6.7 – 7.9 ms | 223 ms | 23.8 ms |
+
+#### Under load, on the whole machine (`multitenant.sh`)
+
+8, 32 and 128 connections send a random mix of the 100 queries for 10 s, to one index holding everything (`TENANTS=1`) or to eight tenants holding an eighth each (eight tenants with their own key in Trailhound; eight indexes in Meilisearch).
+
+| 1 million articles | Trailhound, 8 tenants | Meilisearch, 8 indexes | Trailhound, 1 index | Meilisearch, 1 index |
+| --- | --- | --- | --- | --- |
+| Queries per second (8 / 32 / 128 connections) | 2,200 / 4,600 / 4,800 | 4,000 – 4,900 / 8,000 – 10,300 / 7,700 – 9,900 | 910 / 2,300 / 2,300 | 2,400 – 2,700 / 5,000 – 5,700 / 4,900 – 5,700 |
+| p50 latency, ms | 2.7 / 5.6 / 21 | 1.5 – 1.8 / 2.9 – 3.7 / 13 – 16 | 5.5 / 10 / 43 | 2.7 – 3.1 / 5.1 – 5.9 / 22 – 26 |
+| p99 latency, ms | 27 / 45 / 105 | 3.4 – 4.1 / 6.1 – 7.7 / 16 – 21 | 47 / 64 / 226 | 6.9 – 7.8 / 12 – 14 / 31 – 36 |
+| Highest memory under load | 640 – 755 MB | 9,370 – 9,639 MB | 307 – 490 MB | 3,628 – 3,851 MB |
+| of which the process's own | 40 – 75 MB | 4,500 MB | 20 – 158 MB | 1,100 – 1,200 MB |
+| Loading the documents | 13 s | 167 – 186 s | 50 s | 110 – 120 s |
+| Disk | 709 MB | 7,474 MB | 660 MB | 6,525 MB |
+
+| 6.4 million articles | Trailhound, 8 tenants | Meilisearch, 8 indexes | Trailhound, 1 index | Meilisearch, 1 index |
+| --- | --- | --- | --- | --- |
+| Queries per second (8 / 32 / 128 connections) | 910 / 2,300 / 2,400 | 2,800 / 7,900 / 7,600 | 160 / 390 / 410 | 720 / 1,800 / 1,700 |
+| p50 latency, ms | 3.9 / 7.6 / 28 | 2.1 / 3.8 / 17 | 16 / 27 / 143 | 7.6 / 16 / 71 |
+| p99 latency, ms | 58 / 81 / 325 | 15 / 8.4 / 22 | 439 / 643 / 2,332 | 76 / 53 / 135 |
+| Highest memory under load | 1,750 – 1,923 MB | 10,671 – 10,805 MB | 879 – 1,638 MB | 10,855 – 15,920 MB |
+| of which the process's own | 29 – 128 MB | 4,800 MB | 57 – 440 MB | 1,600 – 1,700 MB |
+| Loading the documents | 99 s | 549 s | 308 s | 852 s |
+| Disk | 4,186 MB | 38,119 MB | 4,079 MB | 50,171 MB |
+
+Median latency of each kind of query with 8 connections on one index, in ms. This is where the two engines differ most:
+
+| | `word` | `title` | `words` | `typo` | `prefix` | `phrase` | `all` | `filter` | `sort` | `browse` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 million: Trailhound | 2.8 | 4.7 | 15.6 | 7.3 | 6.6 | 4.6 | 11.5 | 6.5 | 3.9 | 4.7 |
+| 1 million: Meilisearch | 2.0 | 3.5 | 3.7 | 3.6 | 2.7 | 1.6 | 3.9 | 3.3 | 3.1 | 3.0 |
+| 6.4 million: Trailhound | 6.1 | 11.4 | 219 | 15.6 | 7.8 | 23.1 | 25.1 | 12.4 | 20.2 | 23.1 |
+| 6.4 million: Meilisearch | 4.4 | 6.7 | 14.0 | 8.5 | 4.6 | 3.1 | 7.9 | 9.7 | 6.5 | 12.9 |
+
+#### 512 MB and 2 vCPU
+
+The same load with the server held to two cores and 512 MB (`MEM=512m CPUS=0-1`), the size of the smallest cloud instances.
+
+| Trailhound | 1 million, 8 tenants | 1 million, 1 index | 6.4 million, 8 tenants | 6.4 million, 1 index |
+| --- | --- | --- | --- | --- |
+| Loading the documents | 24 s | 44 s | 189 s | 365 s |
+| Queries per second (8 / 32 / 128 connections) | 110 / 150 / 340 | 150 / 110 / 120 | 21 / 18 / 32 | 12 / 10 / 21 |
+| p50 latency, ms | 58 / 179 / 336 | 44 / 265 / 1,091 | 322 / 1,985 / 6,190 | 527 / 3,533 / 14,038 |
+| p99 latency, ms | 293 / 507 / 791 | 201 / 732 / 1,950 | 1,297 / 4,067 / 8,199 | 2,334 / 6,582 / 21,364 |
+| Highest memory under load | 110 – 237 MB | 111 – 163 MB | 111 – 131 MB | 186 – 208 MB |
+
+Meilisearch was killed for lack of memory while loading the 1 million articles, in each of five attempts: two with eight indexes and two with one, with its default settings, and one with `MEILI_MAX_INDEXING_MEMORY=200Mb` and one indexing thread. It was not tried on the larger set. An index built elsewhere and copied onto a machine of this size was not tried either, so these tables say nothing about how fast Meilisearch searches in 512 MB.
+
+#### Result order (`ranking.sh`)
+
+For each of the 100 queries on the 1 million articles, Trailhound's top 10 hits are sent to Meilisearch to be scored, and the per-rule scores are compared with those of Meilisearch's own top 10, position by position.
+
+- In 77 of the 100 the top 10 is equivalent: the same scores on every rule, in the same order. In 26 of those the ids are identical too; in the rest the differences are documents tied on every rule.
+- In 63 of the 100 both engines count the same number of matches. Most of the others differ by a few documents in thousands; a few differ widely (`bar` as a prefix: 14,475 against 60,198), because Trailhound follows at most 300 dictionary terms per query word and segment.
+- 54 of the 100 pass both checks.
+- Where the top 10 differs, the first rule to differ is `wordPosition` in 11 queries, `attributeRank` in 6, `proximity` in 4 and `exactness` in 2. The `exactness` cases are the difference listed under [What is missing](#what-is-missing), and the cap of 300 terms accounts for some of the `attributeRank` ones. The `wordPosition` and `proximity` cases are partly the rules skipped above 100,000 tied candidates, which real text reaches with common words. The rest are not explained yet.
+
+By kind of query, the top 10 is equivalent in 10 of 10 for `browse`, 9 for `word` and `typo`, 8 for `title`, `prefix`, `filter` and `sort`, 7 for `all`, and 5 for `words` and `phrase`.
+
+#### How to read these tables
+
+Where Meilisearch does better:
+
+- **Searches per second and latency, everywhere.** On 1 million articles Meilisearch serves two to three times as many queries; on 6.4 million, three to five times as many. It uses less CPU per query: on one index of 6.4 million, about 9 ms of CPU against about 50 ms.
+- **The latency tail.** Meilisearch's p99 is one to three times its p50 in most runs (up to ten times with 8 connections on 6.4 million articles). Trailhound's is five to thirty times its p50: 226 ms against 36 ms at 1 million, and 2.3 s against 135 ms on one index of 6.4 million with 128 connections.
+- **Growth with the size of the index.** From 1 to 6.4 million articles, Meilisearch's median for `words` goes from 3.7 to 14 ms and Trailhound's from 16 to 219 ms. Trailhound computes proximity and word position while searching, reading the positions of every candidate, and reads the sort key of every candidate of a sorted search; Meilisearch keeps both precomputed on disk, which is most of why its index is ten times larger.
+- **Queries with common words, phrases, and sorted listings** are where the gap is widest, as the table by kind shows.
+- **Start-up with an empty page cache.** Trailhound reads the index once to verify its checksums: 1.0 to 2.3 s for 4 GB, against 0.4 s.
+- **Fewer limits on what a query sees.** Trailhound follows at most 300 dictionary terms per query word and skips `proximity` and `wordPosition` above 100,000 tied candidates; on real text both limits are reached, and the result order and the count of matches then differ from Meilisearch's.
+
+Where Trailhound does better:
+
+- **Memory while indexing**: 224 MB against 7 GB at 1 million and 950 MB against 22 GB at 6.4 million. Most of Trailhound's figure is file pages of the segments being merged; when indexing ended, the process's own memory was under 20 MB.
+- **Disk**: nine to thirteen times less.
+- **Indexing time**: two to three times faster on one index, and five to fourteen times faster on eight tenants, which Trailhound indexes at the same time.
+- **Memory at rest**: 9 MB for one index of either size, 29 MB for eight tenants, against 77 MB.
+- **It runs in 512 MB**, including indexing 6.4 million articles there, where Meilisearch could not index 1 million. What it serves at that size is slow: about 100 to 300 queries per second on 1 million articles and 10 to 30 on 6.4 million, with medians of seconds once more than a few connections ask at once.
+
+Things to keep in mind:
+
+- **Memory under load is mostly file pages.** Both engines read their index through `mmap`, and the pages a search touches count as memory of the process until the system takes them back. For Trailhound that is nearly all of the figure (778 MB after the searches on 6.4 million articles, 12 MB of it its own; after a start with an empty cache the same searches left 1,838 MB mapped). It is memory the system can reclaim, as the 512 MB runs show, but it is not free: with less memory than index, searches wait for the disk.
+- **Figures vary between runs.** Indexing times moved by 10 to 40% and queries per second by up to 20% between repetitions on this machine; ranges are given where there were several runs, and single figures are one run. Trailhound's start-up after a restart was under half a second in most runs and 2.5 s in one, with eight tenants of the 1 million articles. Meilisearch's 6.4 million figures are one run each.
+- **The load generator** is a Python script on the same machine and competes with the server for CPU; under the 512 MB limit only the server is held to two cores.
+- **The documents are short.** They are the opening of each article, up to 1,000 characters. Whole articles, which are several times longer, were not measured.
+- **Not tested:** ARM; searches while documents are being written; updates and deletions at this scale; facets (this data has no field to facet on); highlighting and cropping; more than eight tenants; and Meilisearch with any setting other than the ones named above.
+- The figures are for the code in this repository on the date above. Typo tolerance, sorting, memory at rest and merging were changed while taking them (see the [changelog](CHANGELOG.md)); version 0.1.0 is slower and uses more memory than these tables say.
+
+### Synthetic documents
+
+300,000 documents of about 320 bytes (95 MB of NDJSON) with an 80-word vocabulary, written by `tests/bench/gen.js`. With so few distinct words, typo tolerance and the dictionary cost almost nothing, which flatters Trailhound's search speed: compare with the tables above. The x86 figures were taken again on 2026-11-24 with the current code, on the same 32-core PC; the ARM figures are from version 0.1.0 on a Mac M1 Max (Docker with 8 CPUs and 4 GB) and were not repeated.
+
+#### Result order (`ranking.sh`)
+
+For 22 queries (one or several words, typos, prefixes, filters, sorting), Trailhound's top 10 hits are sent to Meilisearch to be scored. In all 22, the per-rule scores match those of Meilisearch's own top 10 position by position and both count the same matches, both with the default `searchableAttributes` and with `["title", "description"]`. In 6 to 11 of them, depending on the configuration, the ids are identical too; in the rest, the only differences are documents tied on every rule.
+
+#### One index, one client (`bench.sh`, x86)
 
 | Measure | Trailhound | Meilisearch |
 | --- | --- | --- |
-| Disk | 63 MB | 598 MB |
-| Memory at rest after a restart | 45 MB | 78 MB |
-| Memory after 150 searches | 55 MB | 193 MB |
-| Peak memory while indexing | 95 MB | 2,104 MB |
-| Indexing, 3 batches of 100,000 | 2.7 – 3.2 s | 5.3 – 6.8 s |
-| Search (median, 10 different queries) | 0.9 – 4.1 ms | 1.3 – 2.7 ms |
+| Disk | 63 MB | 601 MB |
+| Memory at rest after a restart | 9 MB | 78 MB |
+| Memory after 150 searches | 37 MB | 194 MB |
+| Peak memory while indexing | 66 MB | 2,105 MB |
+| Indexing, 3 batches of 100,000 | 2.7 s | 5.4 s |
+| Search (median, 10 different queries) | 0.8 – 4.0 ms | 1.3 – 2.8 ms |
 
-### Several tenants at once (`multitenant.sh`)
+#### Several tenants at once (`multitenant.sh`)
 
 Eight tenants with 37,500 documents each (eight tenants with their own key in Trailhound; eight indexes in Meilisearch), with 8, 32 and 128 connections sending a mix of the 10 queries for 10 s.
 
 | x86, 32 cores | Trailhound | Meilisearch |
 | --- | --- | --- |
-| Queries per second (8 / 32 / 128 connections) | 4,700 / 10,400 / 11,900 | 5,900 / 12,100 / 11,400 |
-| p50 latency, ms | 1.7 / 2.9 / 9.4 | 1.2 / 2.5 / 11.0 |
-| p99 latency, ms | 2.8 / 5.8 / 30 | 2.5 / 4.7 / 13.5 |
-| Memory under load | 104 – 190 MB | 1,094 – 1,127 MB |
-| Loading the eight tenants | 1.3 s | 5.0 s |
-| Disk | 72 MB | 546 MB |
+| Queries per second (8 / 32 / 128 connections) | 4,900 / 10,700 / 12,800 | 5,800 / 11,900 / 11,100 |
+| p50 latency, ms | 1.7 / 2.8 / 8.8 | 1.2 / 2.5 / 11.3 |
+| p99 latency, ms | 2.5 / 5.8 / 27 | 2.5 / 4.8 / 13.9 |
+| Highest memory under load | 103 – 193 MB | 1,099 – 1,129 MB |
+| Loading the eight tenants | 1.2 s | 6.1 s |
+| Disk | 72 MB | 544 MB |
 
 | x86, 4 cores | Trailhound | Meilisearch |
 | --- | --- | --- |
-| Queries per second (8 / 32 / 128 connections) | 2,700 / 3,300 / 3,300 | 3,600 / 3,400 / 3,300 |
-| p50 latency, ms | 2.6 / 7.9 / 37 | 2.1 / 9.3 / 38 |
-| p99 latency, ms | 8.0 / 30 / 64 | 4.9 / 13 / 50 |
-| Memory under load | 94 – 107 MB | 831 – 863 MB |
-| Loading the eight tenants | 1.7 s | 16.9 s |
+| Queries per second (8 / 32 / 128 connections) | 2,900 / 3,600 / 3,600 | 4,000 / 3,900 / 3,800 |
+| p50 latency, ms | 2.5 / 7.1 / 33 | 1.9 / 8.0 / 33 |
+| p99 latency, ms | 6.8 / 29 / 60 | 4.4 / 11 / 40 |
+| Highest memory under load | 91 – 99 MB | 844 – 874 MB |
+| Loading the eight tenants | 1.7 s | 16.2 s |
 
-| ARM (Mac M1 Max), 8 Docker cores | Trailhound | Meilisearch |
+| ARM (Mac M1 Max), 8 Docker cores, version 0.1.0 | Trailhound | Meilisearch |
 | --- | --- | --- |
 | Queries per second (8 / 32 / 128 connections) | 2,700 / 4,000 / 4,300 | 3,600 / 4,300 / 4,200 |
 | p50 latency, ms | 2.7 / 7.3 / 28 | 2.0 / 7.1 / 30 |
@@ -472,25 +605,24 @@ Eight tenants with 37,500 documents each (eight tenants with their own key in Tr
 | Loading the eight tenants | 2.2 s | 11.0 s |
 | Disk | 72 MB | 552 MB |
 
-### Simulated t4g.nano size: 512 MB
+#### Simulated t4g.nano size: 512 MB
 
-| | Trailhound, 2 vCPU x86 | Trailhound, 1 vCPU x86 | Trailhound, 2 vCPU ARM | Meilisearch, 2 vCPU (x86 and ARM) |
+| | Trailhound, 2 vCPU x86 | Trailhound, 1 vCPU x86 | Trailhound, 2 vCPU ARM (0.1.0) | Meilisearch, 2 vCPU (x86 and ARM) |
 | --- | --- | --- | --- | --- |
-| Loading the eight tenants | 2.5 s | 5.0 s | 3.7 s | killed for lack of memory |
-| Queries per second (8 / 32 / 128) | 2,050 / 2,200 / 2,200 | 1,200 / 1,230 / 1,235 | 1,550 / 1,650 / 1,660 | — |
-| p50 latency, ms | 3.3 / 9.6 / 53 | 4.6 / 16 / 92 | 4.5 / 16 / 74 | — |
-| p99 latency, ms | 13 / 59 / 109 | 56 / 108 / 204 | 15 / 51 / 116 | — |
-| Memory under load | 80 – 97 MB | 77 – 89 MB | 80 – 98 MB | — |
+| Loading the eight tenants | 2.6 s | 5.3 s | 3.7 s | killed for lack of memory |
+| Queries per second (8 / 32 / 128) | 2,200 / 2,300 / 2,300 | 1,230 / 1,260 / 1,270 | 1,550 / 1,650 / 1,660 | — |
+| p50 latency, ms | 3.1 / 9.2 / 51 | 4.8 / 13 / 92 | 4.5 / 16 / 74 | — |
+| p99 latency, ms | 12 / 59 / 104 | 52 / 112 / 195 | 15 / 51 / 116 | — |
+| Memory under load | 84 – 92 MB | 75 – 81 MB | 80 – 98 MB | — |
 
 How to read these tables:
 
 - The ARM runs used a Mac M1 Max with Docker limited to 2 vCPUs and 512 MB, not a real t4g.nano: M1 cores are faster than Graviton2 cores and a nano runs on CPU credits, so figures there will be lower.
 - At the nano size, Meilisearch was tried with `MEILI_MAX_INDEXING_MEMORY` at 200 Mb and at 100 Mb and one indexing thread; in every case the system killed it for memory while loading.
-- Meilisearch uses less CPU per query (on ARM, 1.0 ms against 1.6 ms): it keeps precomputed on disk what Trailhound computes while searching. With few connections it serves more queries; with many, the two are level.
+- Meilisearch uses less CPU per query (on ARM, 1.0 ms against 1.6 ms): it keeps precomputed on disk what Trailhound computes while searching. With few connections it serves more queries; with many, the two are level. On real text they are not level: see above.
 - Trailhound's latency tail (p99) is worse: some queries cost considerably more than others.
 - The load generator is a Python script on the same machine and competes with the server for CPU.
 - The `proximity` and `wordPosition` rules, and the part of `exactness` that looks at the start of the attribute, are skipped for groups of more than 100,000 tied candidates.
-- The data is synthetic; proportions may change with real text.
 
 ## Development
 

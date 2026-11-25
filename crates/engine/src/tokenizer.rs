@@ -10,7 +10,14 @@ pub struct Token {
     pub end: usize,
     /// Lowercased text without diacritics.
     pub text: String,
+    /// A hard separator stands between the previous token and this one: the
+    /// end of a sentence or of a clause. As in Meilisearch, the two words
+    /// then count as far apart, for proximity and for phrases.
+    pub after_break: bool,
 }
+
+/// Positions skipped at a hard separator, as in Meilisearch.
+pub const BREAK_GAP: u32 = 8;
 
 fn push_normalized(c: char, out: &mut String) {
     if c.is_ascii() {
@@ -31,20 +38,32 @@ pub fn tokenize(text: &str) -> Vec<Token> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut start = 0usize;
+    // Since the last token: a hard separator was seen, and the last
+    // character read was a full stop or a comma.
+    let (mut hard, mut stop, mut after_break) = (false, false, false);
     for (i, c) in text.char_indices() {
         if c.is_alphanumeric() {
             if cur.is_empty() {
                 start = i;
+                after_break = hard && !out.is_empty();
+                hard = false;
             }
             if cur.len() < MAX_TERM_BYTES {
                 push_normalized(c, &mut cur);
             }
-        } else if !cur.is_empty() {
-            out.push(Token { start, end: i, text: std::mem::take(&mut cur) });
+            stop = false;
+            continue;
         }
+        if !cur.is_empty() {
+            out.push(Token { start, end: i, text: std::mem::take(&mut cur), after_break });
+        }
+        // A full stop or a comma only separates when a space follows it:
+        // `3.5` and `a,b` stay together.
+        hard |= matches!(c, '!' | '?' | ';' | '。' | '、' | '،') || (stop && c.is_whitespace());
+        stop = matches!(c, '.' | ',');
     }
     if !cur.is_empty() {
-        out.push(Token { start, end: text.len(), text: cur });
+        out.push(Token { start, end: text.len(), text: cur, after_break });
     }
     out
 }

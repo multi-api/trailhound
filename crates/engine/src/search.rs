@@ -275,6 +275,12 @@ struct TypoState {
     missing: u8,
     accepted: bool,
     dead: bool,
+    /// Typos still allowed on this path. A term that starts with another
+    /// letter than the query is only accepted one edit away, and only for
+    /// words that allow two (see `typo_count`), so most of the dictionary is
+    /// given up on at its first letter.
+    max: u8,
+    first: bool,
 }
 
 impl Typos {
@@ -288,6 +294,13 @@ impl Typos {
 
     fn step(&self, state: &mut TypoState, c: char) {
         let n = self.query.len();
+        if std::mem::take(&mut state.first) && c != self.query[0] {
+            if state.max < 2 {
+                state.dead = true;
+                return;
+            }
+            state.max = 1;
+        }
         let old = state.row;
         let mut prev_diag = state.row[0];
         state.row[0] = state.row[0].saturating_add(1);
@@ -303,7 +316,7 @@ impl Typos {
         }
         state.before = old;
         state.last = c as u32;
-        if self.prefix && state.row[n] <= self.max {
+        if self.prefix && state.row[n] <= state.max {
             state.accepted = true;
         }
     }
@@ -318,15 +331,15 @@ impl Automaton for Typos {
             *slot = j as u8;
         }
         let accepted = self.prefix && row[self.query.len()] <= self.max;
-        TypoState { row, before: row, last: u32::MAX, acc: 0, missing: 0, accepted, dead: false }
+        TypoState { row, before: row, last: u32::MAX, acc: 0, missing: 0, accepted, dead: false, max: self.max, first: true }
     }
 
     fn is_match(&self, s: &TypoState) -> bool {
-        !s.dead && s.missing == 0 && (s.accepted || s.row[self.query.len()] <= self.max)
+        !s.dead && s.missing == 0 && (s.accepted || s.row[self.query.len()] <= s.max)
     }
 
     fn can_match(&self, s: &TypoState) -> bool {
-        !s.dead && (s.accepted || s.row[..=self.query.len()].iter().any(|d| *d <= self.max))
+        !s.dead && (s.accepted || s.row[..=self.query.len()].iter().any(|d| *d <= s.max))
     }
 
     fn will_always_match(&self, s: &TypoState) -> bool {
@@ -827,6 +840,29 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
             }
         }
         Rule::Sort(fids, asc) => {
+            // Only the documents that can reach the page need their key read
+            // in full. Inside a segment the order is known from the column's
+            // numbers and string ranks, so each segment first keeps its best
+            // `want` candidates, and whatever ties with the last of them.
+            let want = need - out.len();
+            let mut cands = cands;
+            if let [fid] = fids[..] {
+                let by_rank = |a: &(u8, f64), b: &(u8, f64)| {
+                    let ord = a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                    if *asc || a.0 == 2 || b.0 == 2 { ord } else { ord.reverse() }
+                };
+                for (s, bm) in cands.iter_mut().enumerate() {
+                    if bm.len() as usize <= want {
+                        continue;
+                    }
+                    let seg = &ctx.st.segs[s].seg;
+                    let mut ranked: Vec<((u8, f64), u32)> = bm.iter().map(|d| (seg.sort_rank(fid, d), d)).collect();
+                    ranked.select_nth_unstable_by(want - 1, |a, b| by_rank(&a.0, &b.0));
+                    let last = ranked[want - 1].0;
+                    *bm = ranked[..want].iter().chain(ranked[want..].iter().filter(|r| by_rank(&r.0, &last) == Ordering::Equal)).map(|r| r.1).collect();
+                }
+            }
+            let total = count(&cands);
             let mut keyed: Vec<(SortKey, usize, u32)> = Vec::with_capacity(total as usize);
             for (s, bm) in cands.iter().enumerate() {
                 let seg = &ctx.st.segs[s].seg;

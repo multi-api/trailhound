@@ -10,6 +10,15 @@ Compatibility with the official Meilisearch clients for Python, Go and PHP and w
 - `fieldDistribution` in the index and global stats counts only live documents. It used to include deleted and replaced documents until their segment was merged.
 - `GET /tasks` accepts the `uids`, `canceledBy`, `reverse`, `beforeEnqueuedAt`, `afterEnqueuedAt`, `beforeStartedAt`, `afterStartedAt`, `beforeFinishedAt` and `afterFinishedAt` parameters, and `*` in the list filters. They were ignored, so a client asking for some tasks got all of them. An invalid `from`, uid or date is now a `400` instead of being ignored.
 
+A benchmark on real text, English Wikipedia at 1 million and 6.4 million articles, next to the synthetic one (`tests/bench/wiki.sh`; the results, including where Meilisearch does better, are in the README). What it turned up and what was changed for it:
+
+- Typo tolerance gives up on a dictionary term at its first letter when that letter rules it out, instead of walking the whole dictionary and discarding those terms afterwards. On 1 million articles a search for a word of 5 to 8 letters spent 4 to 5 ms there and now spends 1 to 2, and a longer word went from 20 to 35 ms down to 6 to 10. Results are the same.
+- A sorted search reads the sort key in full only for the documents that can reach the page. It used to copy the string of every candidate, so sorting 100,000 candidates by title took 24 ms and as many allocations; it takes 2.5 ms now.
+- A server at rest no longer counts its whole index as memory. Verifying the checksums on open left every page of the index mapped in the process: 343 MB at rest for 1 million articles, now 9 MB.
+- Merging no longer compresses documents again. Merges of 400,000 documents or more recompressed all of them at zstd level 19, including those already compressed that way, which made indexing slower the larger the index was: 6.4 million articles took 39 minutes and now take between 5 and 6. Document blocks are 16 KB, where level 19 gains 2% over level 6; the index is about 1% larger.
+- The end of a sentence or clause (`!`, `?`, `;`, and a full stop or comma followed by a space) keeps words apart, as in Meilisearch: a quoted phrase does not match across it and words on both sides do not count as close. Positions used to be counted straight through punctuation, which no synthetic document had. Documents indexed before this change keep their old positions until they are indexed again.
+- The benchmark scripts take a dataset (`DATASET=wiki-1m`), a file of queries, the ports and the binary to test, report start-up time after a restart, the highest memory seen during each level of load and latency per kind of query, raise the open-file limit of both servers, and stop when an index does not hold every document it was sent.
+
 - Roadmap, architecture document, issue forms and a pull request template.
 - CI runs clippy with warnings as errors.
 

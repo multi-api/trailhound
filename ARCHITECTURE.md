@@ -82,7 +82,7 @@ footer   10 × (offset u64, length u64, CRC32 u32), little-endian
          MAGIC again                     8 bytes
 ```
 
-`Segment::open` maps the file, checks both magic numbers and the footer checksum, then the checksum of every section except the documents, whose blocks carry their own and are checked when read. A file in a format the server does not know is refused.
+`Segment::open` maps the file, checks both magic numbers and the footer checksum, then the checksum of every section except the documents, whose blocks carry their own and are checked when read. It then tells the system it no longer needs the pages it has just read (`MADV_DONTNEED`), so a segment that nobody searches adds nothing to the memory of the process. A file in a format the server does not know is refused.
 
 | Constant | Section | Contents |
 | --- | --- | --- |
@@ -134,7 +134,7 @@ Every other write (settings, deletions, index creation) is the same without the 
 1. **Chunks.** `ChunkReader::next_chunk` reads up to 5,000 documents or 4 MB. For each it calls `segment::scan_document`, which walks the JSON without building it, gives every field its id in document order and picks out the primary key. If the index has no primary key yet, it is inferred from the first document (`infer_primary_key`).
 2. **Threads.** A write of fewer than 2,000 documents uses one thread. Otherwise there is one per core, up to four (`index_threads`), and each document goes to the thread chosen by the hash of its id, so two versions of a document always meet on the same thread and the last one wins. The channels have no buffer: the reader waits until a thread is ready.
 3. **Per thread** (`Index::index_part`). The thread parses its documents, keeps one version per id in the batch, and for each calls `Index::supersede`, which finds the stored version (in the segment being built, in the segments this write has already finished, then in the index) and marks it deleted, merging fields first if the write is a partial update. Then `Writer::add` hands the document to a `SegmentBuilder`.
-4. **Building a segment** (`SegmentBuilder::add_doc`). The document's bytes go into the current block. `walk` and `leaf` visit every field: searchable text is tokenized into the term table with positions, filterable values go to the filter table, sortable values to the sort columns. The builder estimates its memory (`mem`); `Writer::add` closes the segment when it reaches its share of the indexing budget (24 MB across threads by default, `configure_indexing`), 200,000 documents or 128 MB of raw documents.
+4. **Building a segment** (`SegmentBuilder::add_doc`). The document's bytes go into the current block. `walk` and `leaf` visit every field: searchable text is tokenized into the term table with positions (a word after the end of a sentence or clause is placed 8 positions on, as in Meilisearch, so phrases and proximity do not reach across it), filterable values go to the filter table, sortable values to the sort columns. The builder estimates its memory (`mem`); `Writer::add` closes the segment when it reaches its share of the indexing budget (24 MB across threads by default, `configure_indexing`), 200,000 documents or 128 MB of raw documents.
 5. **Closing a segment** (`SegmentBuilder::finish`). The sections are written to `seg-N.tmp`, the file is fsynced and renamed to `seg-N.seg`.
 6. **Commit.** When every thread is done, the deletions they recorded are joined, segments left with no live document are dropped, and `Index::commit` replaces the manifest. This is the only moment the write becomes visible, and it is all or nothing: if any thread failed, `Writer::abort` discards the new files and the index is as it was.
 7. `Index::maybe_merge` runs before the write lock is released.
@@ -153,7 +153,7 @@ Following `POST /indexes/{uid}/search`.
 2. **Parse the query.** `parse_query` tokenizes `q` into at most 10 words and at most 10 quoted phrases, drops stop words, marks the last word as a prefix when the query does not end in a separator, and gives each word its typo budget from its length (`typoTolerance.minWordSizeForTypos`).
 3. **Find the terms** (per segment, `word_hits`). For each word the term dictionary is asked for the exact term, for every term with that prefix if the word is a prefix, and for every term within the typo budget:
    - `Typos` implements `fst::Automaton`. Its state is one row of the edit-distance table (plus the previous row, so that swapping two neighbouring letters is one edit), advanced one UTF-8 character at a time. The FST is walked once with it and only branches that can still match are followed. There is nothing to precompute per query.
-   - Each term found is scored by `tokenizer::typo_count`, which applies Meilisearch's rule that a typo in the first letter counts as two.
+   - Each term found is scored by `tokenizer::typo_count`, which applies Meilisearch's rule that a typo in the first letter counts as two. The automaton applies the same rule as it walks: after a first letter that differs from the query's it allows one edit at most, and none for a word that tolerates a single typo, so most of the dictionary is left at its first letter.
    - At most 300 terms are taken per word and segment (`MAX_DERIVATIONS`).
    
    The result is a `WordHits`: the documents matching the word with 0, 1 and 2 typos, per field, and the exact matches. Quoted phrases are resolved first by `phrase_docs`, which reads positions, and narrow the candidates.
@@ -168,7 +168,7 @@ Following `POST /indexes/{uid}/search`.
    | `AttributeRank` | By the order of the matching attribute in `searchableAttributes`. |
    | `WordPosition` | By how far the words are from the start of the attribute (`position_cost`). |
    | `Exactness` | By whether the words appear exactly as typed, and at the start of an attribute. |
-   | `Sort` | By the sort columns (`Segment::sort_key`, `cmp_keys`); ties go on to the next rule. |
+   | `Sort` | By the sort columns. Each segment first keeps its best candidates for the page by number or by string rank (`Segment::sort_rank`), without reading any string; only those are compared across segments (`Segment::sort_key`, `cmp_keys`). Ties go on to the next rule. |
 
    `Proximity`, `WordPosition` and part of `Exactness` read positions for every candidate, and are skipped for buckets of more than 100,000 documents (`PROXIMITY_MAX_DOCS`).
 6. **Facets.** `facet_distribution` scans the filter dictionary of each requested attribute and counts, per value, the documents that are also candidates.
@@ -187,7 +187,7 @@ Every write adds at least one segment, and every search visits all of them, so t
 `segment::merge` does not re-index:
 
 - It first numbers the surviving documents (`remap`), dropping deleted ones.
-- **Documents.** For inputs without deletions, in merges under 400,000 documents, the compressed blocks are copied as they are. Otherwise documents are read and recompressed, at zstd level 19 for merges of 400,000 documents or more.
+- **Documents.** For inputs without deletions, the compressed blocks are copied as they are. The documents of an input with deletions are read and compressed again, at the same zstd level 6 as in a fresh segment: blocks are 16 KB, too small for higher levels to pay (on Wikipedia text, level 19 makes them 2% smaller and takes eleven times as long).
 - **Terms, filter values and primary keys.** The FSTs of the inputs are read together as one sorted stream (`fst::map::OpBuilder::union`); for each key the posting lists are joined with docids renumbered. The new dictionary is written straight to the file while postings and positions go to side files (`Spill`) that are appended afterwards, so memory depends on the largest single posting list, not on the size of the segments.
 - **Range levels** are built again from the merged values.
 - **Sort columns** are rebuilt in memory, which is the one part whose cost grows with the number of documents.
@@ -231,7 +231,7 @@ If a change trades memory for speed, measure both with `tests/bench/multitenant.
 | Add a setting | A field of `settings::Settings`. If it changes what segments contain, extend `Settings::needs_reindex`. The settings routes need no change. |
 | Add a filter operator | `Filter`, `Parser::primary` and `eval` in `filter.rs`. |
 | Add a ranking rule or change one | `search::Rule`, the list built in `search::search`, and a branch of `search::rank`. Keep `tests/bench/ranking.sh` at 22 of 22. |
-| Change how text is split or normalized | `tokenizer::tokenize`. Existing segments were built with the old rules, so this is a format change. |
+| Change how text is split or normalized | `tokenizer::tokenize`. Existing segments were built with the old rules, so this is a format change. (The position gap at hard separators was added without one: segments written before it are read as they are, with their words counted straight through punctuation, until their documents are indexed again.) |
 | Store something new per document or per term | A section or a key in `segment.rs`: `SegmentBuilder`, `merge` and `Segment` all need it. Bump `MAGIC`. |
 | Change when segments are merged | The constants at the top of `index.rs` and `Index::maybe_merge`. |
 | Authentication, keys, tenant tokens | `api::Auth` and `Platform::resolve`. |

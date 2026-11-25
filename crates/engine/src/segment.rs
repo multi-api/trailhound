@@ -6,7 +6,7 @@
 //! detected when it is read instead of being served.
 
 use crate::settings::{attr_matches, Settings};
-use crate::tokenizer::{normalize_facet, tokenize};
+use crate::tokenizer::{normalize_facet, tokenize, BREAK_GAP};
 use crate::util::{encode_f64, read_docset, read_varint, write_docset, write_varint};
 use crate::{Error, Result};
 use fst::map::OpBuilder;
@@ -629,6 +629,9 @@ impl SegmentBuilder {
                 let base = self.next_pos.get(&fid).copied().unwrap_or(0);
                 let mut count = 0u32;
                 for tok in tokenize(&text) {
+                    if tok.after_break {
+                        count += BREAK_GAP - 1;
+                    }
                     let pos = base + count;
                     count += 1;
                     let cost = tok.text.len() + ENTRY_COST;
@@ -986,9 +989,9 @@ fn flush_merged_block(sink: &mut Sink, block: &mut Vec<u8>, docidx: &mut Vec<u8>
 /// streams, dropping deleted documents on the way. Memory use depends on the
 /// largest single posting list, not on the size of the segments.
 ///
-/// With `copy_blocks`, the document blocks of inputs without deletions are
-/// copied as they are, still compressed.
-pub fn merge(inputs: &[MergeInput], schema: &Schema, path: &Path, level: i32, copy_blocks: bool) -> Result<u32> {
+/// The document blocks of inputs without deletions are copied as they are,
+/// still compressed; the documents of the others are compressed at `level`.
+pub fn merge(inputs: &[MergeInput], schema: &Schema, path: &Path, level: i32) -> Result<u32> {
     // Old docid -> new docid per input; u32::MAX for deleted documents.
     let mut remap: Vec<Vec<u32>> = Vec::with_capacity(inputs.len());
     let mut n = 0u32;
@@ -1024,7 +1027,7 @@ pub fn merge(inputs: &[MergeInput], schema: &Schema, path: &Path, level: i32, co
                 *counts.entry(*fid).or_insert(0) += c;
             }
         }
-        if copy_blocks && !recount {
+        if !recount {
             flush_merged_block(&mut sink, &mut block, &mut docidx, block_first, level)?;
             for b in 0..inp.seg.block_count() {
                 let (off, len, first, crc) = inp.seg.block_entry(b);
@@ -1329,6 +1332,13 @@ impl Segment {
                 return Err(bad("section checksum mismatch"));
             }
             secs.push(Section { mmap: mmap.clone(), off, len });
+        }
+        // The checksums have just read every page of the index. Let go of
+        // them, so that a server at rest holds only what its searches touch;
+        // the pages stay in the system's cache and come back on first use.
+        #[cfg(unix)]
+        unsafe {
+            let _ = mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed);
         }
         let meta: MetaFile = serde_json::from_slice(secs[S_META].as_ref())?;
         Ok(Segment {
@@ -1642,6 +1652,31 @@ impl Segment {
             f(key, orig, bm)?;
         }
         Ok(())
+    }
+
+    /// A document's place in the order of one sort column, comparable only
+    /// inside this segment: numbers first, then strings by their rank among
+    /// the segment's strings, then documents without a value. Unlike
+    /// `sort_key` it copies no string.
+    pub fn sort_rank(&self, fid: u16, docid: u32) -> (u8, f64) {
+        let Some(col) = self.sortcols.get(&fid) else { return (2, 0.0) };
+        let buf = self.sort.as_ref();
+        let d = docid as usize;
+        if let Some((off, _)) = col.num {
+            let p = off as usize + d * 8;
+            let f = f64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+            if !f.is_nan() {
+                return (0, f);
+            }
+        }
+        if let Some((off, _)) = col.ord {
+            let p = off as usize + d * 4;
+            let ord = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+            if ord != u32::MAX {
+                return (1, ord as f64);
+            }
+        }
+        (2, 0.0)
     }
 
     pub fn sort_key(&self, fid: u16, docid: u32) -> SortKey {

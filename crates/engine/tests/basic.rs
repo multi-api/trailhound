@@ -409,6 +409,75 @@ fn typo_matching_agrees_with_edit_distance() {
     assert!(checked > 200, "only {checked} queries were checked");
 }
 
+/// Sorting picks each segment's best candidates before comparing across
+/// segments; a page must be the same as when every document is sorted.
+#[test]
+fn sorted_pages_match_a_full_sort() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = Index::create(dir.path(), "s", Some("id".into()), 0).unwrap();
+    let s = Settings { sortable_attributes: vec!["n".into(), "name".into(), "mixed".into()], ..Default::default() };
+    index.update_settings(s, 1).unwrap();
+    // Few distinct values, so that ties cross the edge of every page; some
+    // documents have no value, and `mixed` holds numbers and strings.
+    let n = |i: u64| (i * 7919) % 40;
+    let name = |i: u64| format!("n{:02}", (i * 104729) % 55);
+    let docs: Vec<Value> = (0..900u64)
+        .map(|i| {
+            let mut d = json!({"id": i, "w": "comun"});
+            if i % 9 != 0 {
+                d["n"] = json!(n(i));
+                d["name"] = json!(name(i));
+            }
+            if i % 4 != 0 {
+                d["mixed"] = if i % 3 == 0 { json!(name(i)) } else { json!(n(i)) };
+            }
+            d
+        })
+        .collect();
+    for (task, batch) in docs.chunks(150).enumerate() {
+        index.add_documents(batch.to_vec(), None, false, task as u64 + 2).unwrap();
+    }
+    for (field, dir) in [("n", "asc"), ("n", "desc"), ("name", "asc"), ("name", "desc"), ("mixed", "asc"), ("mixed", "desc")] {
+        let all = index.search(&q(json!({"q": "comun", "sort": [format!("{field}:{dir}")], "limit": 900, "attributesToRetrieve": ["id", field]}))).unwrap();
+        let all = all["hits"].as_array().unwrap();
+        assert_eq!(all.len(), 900);
+        for (offset, limit) in [(0, 1), (0, 20), (15, 30), (490, 25), (700, 200)] {
+            let page = index.search(&q(json!({"q": "comun", "sort": [format!("{field}:{dir}")], "offset": offset, "limit": limit, "attributesToRetrieve": ["id", field]}))).unwrap();
+            let page = page["hits"].as_array().unwrap();
+            assert_eq!(page.len(), limit);
+            // Ties may come out in another order, never with another value.
+            for (got, want) in page.iter().zip(&all[offset..]) {
+                assert_eq!(got.get(field), want.get(field), "{field}:{dir} offset {offset} limit {limit}");
+            }
+        }
+    }
+}
+
+/// The end of a sentence or of a clause keeps two words apart, as in
+/// Meilisearch: no phrase across it, and no better proximity than words
+/// that are far from each other.
+#[test]
+fn hard_separators_keep_words_apart() {
+    use trailhound_engine::tokenizer::tokenize;
+    let breaks = |text: &str| tokenize(text).iter().map(|t| t.after_break).collect::<Vec<_>>();
+    assert_eq!(breaks("red fox. Blue, bird; grey-wolf (old) cat"), [false, false, true, true, true, false, false, false]);
+    // A full stop or a comma inside a word or a number is not a break.
+    assert_eq!(breaks("version 3.5 of a.b,c"), [false; 7]);
+    assert_eq!(breaks("...what? Yes"), [false, true]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let index = Index::create(dir.path(), "b", Some("id".into()), 0).unwrap();
+    let docs = json!([
+        {"id": 1, "t": "the red fox jumps"},
+        {"id": 2, "t": "it was red. Fox hunting is banned"},
+        {"id": 3, "t": "red and then some more words fox"}
+    ]);
+    index.add_documents(docs.as_array().unwrap().clone(), None, false, 1).unwrap();
+    let ids = |v: Value| index.search(&q(v)).unwrap()["hits"].as_array().unwrap().iter().map(|h| h["id"].as_u64().unwrap()).collect::<Vec<_>>();
+    assert_eq!(ids(json!({"q": "\"red fox\""})), [1]);
+    assert_eq!(ids(json!({"q": "red fox", "matchingStrategy": "all"}))[0], 1);
+}
+
 #[test]
 fn deeply_nested_filters_are_refused() {
     use trailhound_engine::filter::parse_str;
