@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "uid": "old",
+  "primary_key": "id",
+  "fields": [
+    "id",
+    "w",
+    "n",
+    "name",
+    "mixed"
+  ],
+  "settings": {
+    "displayedAttributes": [
+      "*"
+    ],
+    "searchableAttributes": [
+      "*"
+    ],
+    "filterableAttributes": [
+      "n"
+    ],
+    "sortableAttributes": [
+      "n",
+      "name",
+      "mixed"
+    ],
+    "rankingRules": [
+      "words",
+      "typo",
+      "proximity",
+      "attributeRank",
+      "sort",
+      "wordPosition",
+      "exactness"
+    ],
+    "stopWords": [],
+    "synonyms": {},
+    "distinctAttribute": null,
+    "typoTolerance": {
+      "enabled": true,
+      "minWordSizeForTypos": {
+        "oneTypo": 5,
+        "twoTypos": 9
+      },
+      "disableOnWords": [],
+      "disableOnAttributes": []
+    },
+    "faceting": {
+      "maxValuesPerFacet": 100,
+      "sortFacetValuesBy": {
+        "*": "alpha"
+      }
+    },
+    "pagination": {
+      "maxTotalHits": 1000
+    }
+  },
+  "segments": [
+    {
+      "id": 1,
+      "docs": 20,
+      "deleted": "OjAAAAEAAAAAAAAAEAAAAAcA"
+    },
+    {
+      "id": 2,
+      "docs": 20,
+      "deleted": "OjAAAAEAAAAAAAAAEAAAAA0A"
+    },
+    {
+      "id": 3,
+      "docs": 20,
+      "deleted": ""
+    }
+  ],
+  "next_seg": 4,
+  "applied_task": 9,
+  "created_at": "2026-11-25T03:19:54.5001479Z",
+  "updated_at": "2026-11-25T03:19:54.5327921Z"
+}

@@ -75,14 +75,16 @@ In memory, `Index::state` is an `Arc<State>` (manifest, open segments, `Schema`)
 Defined in `crates/engine/src/segment.rs`. Written by `SegmentBuilder` (new documents) and `merge` (existing segments), read by `Segment`.
 
 ```
-MAGIC "THSEG001"                         8 bytes
+MAGIC "THSEG002"                         8 bytes
 section 0 .. section 9                   in the order of the table below
 footer   10 × (offset u64, length u64, CRC32 u32), little-endian
          CRC32 of those 200 bytes        4 bytes
          MAGIC again                     8 bytes
 ```
 
-`Segment::open` maps the file, checks both magic numbers and the footer checksum, then the checksum of every section except the documents, whose blocks carry their own and are checked when read. It then tells the system it no longer needs the pages it has just read (`MADV_DONTNEED`), so a segment that nobody searches adds nothing to the memory of the process. A file in a format the server does not know is refused.
+`Segment::open` maps the file, checks both magic numbers and the footer checksum, then the checksum of every section except the documents, whose blocks carry their own and are checked when read. The checksums are computed four megabytes at a time (`checksum`), telling the system after each piece that the pages just read are no longer needed (`MADV_DONTNEED`): opening a segment of any size adds a few megabytes to the memory of the process, and a segment that nobody searches adds nothing. A file in a format the server does not know is refused.
+
+`THSEG001`, the format before this one, is still read (`MAGIC_V1`). It differs in two things that a reader can do without: its sort columns have no sorted order, and its metadata does not say which fields hold one number per document. Searches on such a segment take the slower paths described below, and a merge writes its documents into a segment of the current format.
 
 | Constant | Section | Contents |
 | --- | --- | --- |
@@ -93,8 +95,8 @@ footer   10 × (offset u64, length u64, CRC32 u32), little-endian
 | `S_FACETS` | Filter dictionary | An FST from `field id (2 bytes, big-endian) + tag (1 byte) + value` to an offset in the filter postings. Built by `facet_key`. |
 | `S_FACETS_POST` | Filter postings | Per key: the value as it appeared in the document (for facet distributions) and the set of documents. |
 | `S_PKS` | Primary keys | An FST from the document's primary key, as text, to its docid. |
-| `S_SORT` | Sort columns | Per sortable field: a column of `f64` (NaN where missing) and, for text, a column of ordinals into a sorted table of distinct strings. Read by `Segment::sort_key`. |
-| `S_META` | Metadata | JSON: the number of documents, how many documents have each field (`fieldDistribution`), and where each sort column is. |
+| `S_SORT` | Sort columns | Per sortable field: a column of `f64` (NaN where missing); for text, a column of ordinals into a sorted table of distinct strings; and the sorted order, the docids of the documents that have a value as `u32`, ascending by value (numbers, then strings) and by docid among equals. Read by `Segment::sort_key`, `Segment::sort_ranks` and `Segment::sort_head`. |
+| `S_META` | Metadata | JSON: the number of documents, how many documents have each field (`fieldDistribution`), where each sort column is, and the filterable fields in which some document holds more than one number (`multi_num`). |
 | `S_POS` | Positions | For each posting list, per document in order, the token positions as varints holding the distance from the previous position, shifted left by one, with the low bit saying whether another position of the same document follows. |
 
 Details that matter when you touch this file:
@@ -149,12 +151,14 @@ Following `POST /indexes/{uid}/search`.
 
 `api::run_search` checks the key, counts the search for the tenant and runs `Index::search` on a blocking thread. That takes a snapshot and calls `search::search` in `crates/engine/src/search.rs`. Everything below works per segment on bitmaps of docids (`Cands`, one `RoaringBitmap` per segment).
 
-1. **Filter.** `index::universe` starts from the live documents of each segment (all minus deleted) and intersects them with the filter. `filter::parse_value` turns the filter into a `Filter` tree; `filter::eval` evaluates it with lookups in the filter dictionary (`Segment::facet_get`, `Segment::num_range`).
+1. **Filter.** `filter::parse_value` turns the filter into a `Filter` tree. `index::universe_of` starts from the live documents of each segment (all minus deleted) and intersects them with what `filter::eval` finds with lookups in the filter dictionary (`Segment::facet_get`, `Segment::num_range`).
+
+   `price >= 10 AND price < 20` asks for a document with a number from 10 up and a number below 20; for a document holding `[5, 900]` those are two different numbers, and it matches. In a segment where no document has two numbers in the field (`Segment::one_number_each`), the two conditions are one range, and `eval` reads it as one: a few short lists instead of two unions that each cover most of the segment. Otherwise each bound is evaluated on its own.
 2. **Parse the query.** `parse_query` tokenizes `q` into at most 10 words and at most 10 quoted phrases, drops stop words, marks the last word as a prefix when the query does not end in a separator, and gives each word its typo budget from its length (`typoTolerance.minWordSizeForTypos`).
 3. **Find the terms** (per segment, `word_hits`). For each word the term dictionary is asked for the exact term, for every term with that prefix if the word is a prefix, and for every term within the typo budget:
    - `Typos` implements `fst::Automaton`. Its state is one row of the edit-distance table (plus the previous row, so that swapping two neighbouring letters is one edit), advanced one UTF-8 character at a time. The FST is walked once with it and only branches that can still match are followed. There is nothing to precompute per query.
    - Each term found is scored by `tokenizer::typo_count`, which applies Meilisearch's rule that a typo in the first letter counts as two. The automaton applies the same rule as it walks: after a first letter that differs from the query's it allows one edit at most, and none for a word that tolerates a single typo, so most of the dictionary is left at its first letter.
-   - At most 300 terms are taken per word and segment (`MAX_DERIVATIONS`).
+   - At most 300 terms are taken per word and segment (`MAX_DERIVATIONS`), or the segment's share by documents of 2,400 for the whole index if that is more (`derivation_limit`): an index held in one segment follows as many terms as the same index split in eight.
    
    The result is a `WordHits`: the documents matching the word with 0, 1 and 2 typos, per field, and the exact matches. Quoted phrases are resolved first by `phrase_docs`, which reads positions, and narrow the candidates.
 4. **Candidates.** With `matchingStrategy: "all"` a document must contain every word; otherwise it must contain the first one, and the `words` rule sorts by how many of the following words it also has.
@@ -165,10 +169,12 @@ Following `POST /indexes/{uid}/search`.
    | `Words` | By how many of the query words, counted from the first, the document contains. |
    | `Typo` | By the total number of typos, with bitmap operations on `WordHits::lvl`. |
    | `Proximity` | By the distance between consecutive query words, read from positions (`Segment::scan_positions`, `proximity`). |
-   | `AttributeRank` | By the order of the matching attribute in `searchableAttributes`. |
+   | `AttributeRank` | By the order of the matching attribute in `searchableAttributes`. In the bucket of documents that match every word without a typo, only the attributes where they match that way count (`WordHits::per_field_exact`). |
    | `WordPosition` | By how far the words are from the start of the attribute (`position_cost`). |
    | `Exactness` | By whether the words appear exactly as typed, and at the start of an attribute. |
-   | `Sort` | By the sort columns. Each segment first keeps its best candidates for the page by number or by string rank (`Segment::sort_rank`), without reading any string; only those are compared across segments (`Segment::sort_key`, `cmp_keys`). Ties go on to the next rule. |
+   | `Sort` | By the sort columns. Each segment first keeps its best candidates for the page, without reading any string; only those are compared across segments (`Segment::sort_key`, `cmp_keys`). Ties go on to the next rule. |
+
+   How a segment finds its best candidates depends on how many there are. With many, `Segment::sort_head` walks the stored order of the field from its start, or from its end for a descending sort, and stops when it has enough for the page: the cost is the number of entries it reads, about `doc_count / candidates` for each hit when the candidates are spread evenly. If the filter bounds the same field (`filter::bounds`) and the segment has one number per document in it, the walk starts at the bound, found by binary search, instead of going through everything below it. With few candidates, or when the walk has read a quarter as many entries as there are candidates without filling the page (`WALK_COST`), the rank of every candidate is read instead (`Segment::sort_ranks`) and the best are selected, which is also what a `THSEG001` segment gets.
 
    `Proximity`, `WordPosition` and part of `Exactness` read positions for every candidate, and are skipped for buckets of more than 100,000 documents (`PROXIMITY_MAX_DOCS`).
 6. **Facets.** `facet_distribution` scans the filter dictionary of each requested attribute and counts, per value, the documents that are also candidates.
@@ -182,15 +188,18 @@ Following `POST /indexes/{uid}/search`.
 
 Every write adds at least one segment, and every search visits all of them, so their number is kept bounded.
 
-`Index::maybe_merge` runs after each write: above 8 segments (`MERGE_TRIGGER`) it takes the 5 with the fewest live documents (`MERGE_WIDTH`), up to a million documents in total, and joins them with `segment::merge`, repeating until the count is back under the limit.
+`Index::maybe_merge` runs after each write: above 8 segments (`MERGE_TRIGGER`) it joins the smallest with `segment::merge`, repeating until the count is back under the limit. `pick_merge` chooses them: starting from the one with the fewest live documents, a segment joins while it is at most twice the size of everything gathered below it (`MERGE_RATIO`), up to 16 segments (`MERGE_WIDTH`) and a million documents in total (`MAX_MERGED_DOCS`). The small segments a write leaves behind are thus joined in one pass, and a large segment is not written again to take in a few documents: loading 6.4 million Wikipedia articles took a quarter less time than with the earlier rule, which always joined the five smallest.
+
+The cap on the size of a merged segment is a trade, measured on those 6.4 million articles: with segments of up to 4 or 64 million documents, searches that touch little (one word, a title, a sorted search) were 20 to 60% faster at the median, because the dictionary is walked fewer times; searches for several common words were 10 to 15% slower under load and up to twice as slow when running alone, because a search that is alone spreads its segments over threads and one large segment gives it nothing to spread; and merging needed 1.5 to 2.2 GB more free disk. It stays at a million until ranking reads fewer positions (see the roadmap).
 
 `segment::merge` does not re-index:
 
 - It first numbers the surviving documents (`remap`), dropping deleted ones.
 - **Documents.** For inputs without deletions, the compressed blocks are copied as they are. The documents of an input with deletions are read and compressed again, at the same zstd level 6 as in a fresh segment: blocks are 16 KB, too small for higher levels to pay (on Wikipedia text, level 19 makes them 2% smaller and takes eleven times as long).
-- **Terms, filter values and primary keys.** The FSTs of the inputs are read together as one sorted stream (`fst::map::OpBuilder::union`); for each key the posting lists are joined with docids renumbered. The new dictionary is written straight to the file while postings and positions go to side files (`Spill`) that are appended afterwards, so memory depends on the largest single posting list, not on the size of the segments.
+- **Terms, filter values and primary keys.** The FSTs of the inputs are read together as one sorted stream (`fst::map::OpBuilder::union`); for each key the posting lists are joined with docids renumbered. The new dictionary is written straight to the file while postings and positions go to side files (`Spill`) that are appended afterwards. New docids follow the inputs one after another, so the positions of a term are copied to the side file input by input and only its set of documents is put together in memory.
 - **Range levels** are built again from the merged values.
-- **Sort columns** are rebuilt in memory, which is the one part whose cost grows with the number of documents.
+- **Sort columns** (`merge_sort_column`) are copied input by input for the same reason. The distinct strings of the inputs are merged as sorted lists into two side files, and the sorted order is the inputs' orders merged, a string comparing by its place among the merged strings. What is held in memory is, per input, four bytes for each of its distinct strings.
+- **Memory.** Besides that table and `remap` (four bytes per document), a merge holds buffers of fixed size. It reads its inputs from end to end through `mmap`, and every 32 MB written it tells the system that it is done with the pages behind it (`Segment::release_pages`), so the size of the segments does not show in the memory of the process.
 
 The result is committed like any other write: a new manifest that lists the merged segment instead of its inputs.
 
@@ -232,7 +241,7 @@ If a change trades memory for speed, measure both with `tests/bench/multitenant.
 | Add a filter operator | `Filter`, `Parser::primary` and `eval` in `filter.rs`. |
 | Add a ranking rule or change one | `search::Rule`, the list built in `search::search`, and a branch of `search::rank`. Keep `tests/bench/ranking.sh` at 22 of 22. |
 | Change how text is split or normalized | `tokenizer::tokenize`. Existing segments were built with the old rules, so this is a format change. (The position gap at hard separators was added without one: segments written before it are read as they are, with their words counted straight through punctuation, until their documents are indexed again.) |
-| Store something new per document or per term | A section or a key in `segment.rs`: `SegmentBuilder`, `merge` and `Segment` all need it. Bump `MAGIC`. |
+| Store something new per document or per term | A section or a key in `segment.rs`: `SegmentBuilder`, `merge` and `Segment` all need it. Bump `MAGIC`. If a reader can do without the new data, keep reading the old format as `THSEG001` is read, and add a data folder written by the old version to `crates/engine/tests/fixtures`. |
 | Change when segments are merged | The constants at the top of `index.rs` and `Index::maybe_merge`. |
 | Authentication, keys, tenant tokens | `api::Auth` and `Platform::resolve`. |
 | Quotas and usage | `Tenant::check_document_quota`, `Tenant::create_index`, `Tenant::usage`. |
@@ -240,7 +249,7 @@ If a change trades memory for speed, measure both with `tests/bench/multitenant.
 
 ## Tests
 
-- `crates/engine/tests/basic.rs`: the engine through its public API, including round trips, merges compared against a freshly built index, range filters compared against a full scan, and the typo automaton compared against plain edit distance.
+- `crates/engine/tests/basic.rs`: the engine through its public API, including round trips, merges compared against a freshly built index, range filters compared against a full scan, sorted searches compared against a sort of the documents, the typo automaton compared against plain edit distance, and a data folder in the previous segment format (`tests/fixtures/thseg001`) that is opened, searched and merged.
 - `tests/sdk/compat.mjs`: the HTTP API through the official JavaScript SDK, against a running server.
 - `tests/sdk-python`, `tests/sdk-go`, `tests/sdk-php`: the same checks through the official Python, Go and PHP clients.
 - `tests/sdk-laravel`: a minimal Laravel application that uses the server through Laravel Scout's Meilisearch driver.

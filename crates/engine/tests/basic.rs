@@ -539,3 +539,212 @@ fn rfc3339_dates_compare_across_offsets() {
         assert_eq!(at(bad), None, "{bad}");
     }
 }
+
+/// The value a document is sorted by: of several, the first.
+fn sort_value(v: &Value) -> &Value {
+    match v {
+        Value::Array(items) => items.first().unwrap_or(&Value::Null),
+        other => other,
+    }
+}
+
+/// What a sorted search must return for `field` over `docs`: numbers before
+/// strings when ascending and the reverse when descending, and documents
+/// without a value last either way. `None` stands for no value.
+fn sorted_values(docs: &[&Value], field: &str, asc: bool) -> Vec<Option<Value>> {
+    let mut nums: Vec<f64> = docs.iter().filter_map(|d| sort_value(&d[field]).as_f64()).collect();
+    let mut strs: Vec<&str> = docs.iter().filter_map(|d| sort_value(&d[field]).as_str()).collect();
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    strs.sort();
+    let mut out: Vec<Option<Value>> = nums.into_iter().map(|n| Some(json!(n))).chain(strs.into_iter().map(|s| Some(json!(s)))).collect();
+    if !asc {
+        out.reverse();
+    }
+    out.resize(docs.len(), None);
+    out
+}
+
+/// Compare pages of sorted searches with a sort done here, value by value:
+/// documents with the same value may come out in any order.
+fn assert_sorted(index: &Index, docs: &[&Value], filter: Option<&str>, fields: &[&str], label: &str) {
+    for field in fields {
+        for asc in [true, false] {
+            let expected = sorted_values(docs, field, asc);
+            for (offset, limit) in [(0usize, 1usize), (0, 10), (7, 25), (120, 40)] {
+                let sort = format!("{field}:{}", if asc { "asc" } else { "desc" });
+                let res = index.search(&q(json!({"q": "", "filter": filter, "sort": [sort], "offset": offset, "limit": limit, "attributesToRetrieve": ["id", field]}))).unwrap();
+                let hits = res["hits"].as_array().unwrap();
+                let got: Vec<Option<Value>> = hits.iter().map(|h| h.get(*field).map(sort_value).map(|v| if v.is_number() { json!(v.as_f64().unwrap()) } else { v.clone() })).collect();
+                let want: Vec<Option<Value>> = expected.iter().skip(offset).take(limit).cloned().collect();
+                assert_eq!(got, want, "{label}: filter {filter:?}, {sort}, offset {offset}, limit {limit}");
+                let mut ids: Vec<u64> = hits.iter().map(|h| h["id"].as_u64().unwrap()).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                assert_eq!(ids.len(), hits.len(), "{label}: a document came twice");
+                assert!(ids.iter().all(|id| docs.iter().any(|d| d["id"] == *id)), "{label}: a document outside the filter");
+            }
+        }
+    }
+}
+
+/// A sorted search reads each segment's stored order until the page is full,
+/// or ranks every candidate when they are few or far from the start. Both
+/// must give what sorting the matching documents gives: with many, few and
+/// no candidates, with a filter on the field that is sorted, with documents
+/// deleted, and after the segments have been merged and opened again.
+#[test]
+fn sorted_searches_match_a_sort_of_the_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = Index::create(dir.path(), "s", Some("id".into()), 0).unwrap();
+    let s = Settings { filterable_attributes: vec!["k".into(), "n".into()], sortable_attributes: vec!["n".into(), "name".into(), "mixed".into(), "rare".into()], ..Default::default() };
+    index.update_settings(s, 1).unwrap();
+    let make = |i: u64| {
+        let mut d = json!({"id": i, "k": i % 10});
+        if !i.is_multiple_of(9) {
+            d["n"] = json!((i * 7919) % 977);
+            d["name"] = json!(format!("n{:03}", (i * 104729) % 350));
+        }
+        if !i.is_multiple_of(4) {
+            d["mixed"] = if i.is_multiple_of(3) { json!(format!("m{:02}", i % 61)) } else { json!((i * 31) % 211) };
+        }
+        if i % 50 == 3 {
+            d["rare"] = json!(i as f64 / 8.0);
+        }
+        d
+    };
+    let mut docs: std::collections::BTreeMap<u64, Value> = (0..6000u64).map(|i| (i, make(i))).collect();
+    let all: Vec<Value> = docs.values().cloned().collect();
+    let mut task = 2;
+    for batch in all.chunks(1500) {
+        index.add_documents(batch.to_vec(), None, false, task).unwrap();
+        task += 1;
+    }
+    let gone: Vec<String> = (0..6000u64).filter(|i| i % 13 == 0).map(|i| i.to_string()).collect();
+    index.delete_documents(&gone, task).unwrap();
+    docs.retain(|i, _| i % 13 != 0);
+
+    type Keep = fn(&Value) -> bool;
+    let filters: [(Option<&str>, Keep); 10] = [
+        (None, |_| true),
+        (Some("n >= 300 AND n < 400"), |d| d["n"].as_u64().is_some_and(|n| (300..400).contains(&n))),
+        (Some("n > 100 AND k = 3 AND n <= 160"), |d| d["k"] == 3 && d["n"].as_u64().is_some_and(|n| n > 100 && n <= 160)),
+        (Some("n >= 400 AND n < 300"), |_| false),
+        (Some("k = 3"), |d| d["k"] == 3),
+        (Some("k < 5"), |d| d["k"].as_u64().unwrap() < 5),
+        (Some("n >= 600"), |d| d["n"].as_u64().is_some_and(|n| n >= 600)),
+        (Some("n < 100"), |d| d["n"].as_u64().is_some_and(|n| n < 100)),
+        (Some("n = 5"), |d| d["n"] == 5),
+        (Some("k = 3 AND n > 5000"), |_| false),
+    ];
+    let fields = ["n", "name", "mixed", "rare"];
+    let check = |index: &Index, docs: &std::collections::BTreeMap<u64, Value>, label: &str| {
+        for (filter, keep) in &filters {
+            let matching: Vec<&Value> = docs.values().filter(|d| keep(d)).collect();
+            assert_sorted(index, &matching, *filter, &fields, label);
+        }
+    };
+    assert_eq!(index.stats().segments, 4);
+    check(&index, &docs, "four segments");
+
+    // Small writes until the segments are merged, twice over.
+    for round in 0..12u64 {
+        let batch: Vec<Value> = (0..40u64).map(|i| make(6000 + round * 40 + i)).collect();
+        for d in &batch {
+            docs.insert(d["id"].as_u64().unwrap(), d.clone());
+        }
+        task += 1;
+        index.add_documents(batch, None, false, task).unwrap();
+    }
+    assert!(index.stats().segments <= 8, "segments: {}", index.stats().segments);
+    check(&index, &docs, "after merges");
+    drop(index);
+    check(&Index::open(dir.path()).unwrap(), &docs, "reopened");
+}
+
+/// A data folder written in the previous segment format, `THSEG001`, which
+/// has no stored order: it is opened and sorted as before, and its segments
+/// get the order when they are merged.
+#[test]
+fn segments_of_the_previous_format_are_read_and_merged() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/thseg001");
+    let dir = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(&fixture).unwrap().flatten() {
+        std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+    }
+    // The documents the fixture was built from.
+    let make = |i: u64| {
+        let mut d = json!({"id": i, "w": "comun"});
+        if !i.is_multiple_of(9) {
+            d["n"] = json!((i * 7919) % 13);
+            d["name"] = json!(format!("n{:02}", (i * 104729) % 17));
+        }
+        if !i.is_multiple_of(4) {
+            d["mixed"] = if i.is_multiple_of(3) { json!(format!("m{:02}", i % 5)) } else { json!((i * 31) % 7) };
+        }
+        d
+    };
+    let mut docs: std::collections::BTreeMap<u64, Value> = (0..60u64).filter(|i| *i != 7 && *i != 33).map(|i| (i, make(i))).collect();
+    let fields = ["n", "name", "mixed"];
+    let check = |index: &Index, docs: &std::collections::BTreeMap<u64, Value>, label: &str| {
+        assert_eq!(index.stats().number_of_documents, docs.len() as u64);
+        assert_sorted(index, &docs.values().collect::<Vec<_>>(), None, &fields, label);
+        let some: Vec<&Value> = docs.values().filter(|d| d["n"].as_u64().is_some_and(|n| n >= 4)).collect();
+        assert_sorted(index, &some, Some("n >= 4"), &fields, label);
+    };
+    let index = Index::open(dir.path()).unwrap();
+    assert_eq!(index.stats().segments, 3);
+    check(&index, &docs, "as written by the previous version");
+    assert_eq!(index.get_document("12").unwrap().unwrap(), make(12));
+
+    // New writes go next to the old segments, and merges take them in.
+    for round in 0..7u64 {
+        let batch: Vec<Value> = (0..30u64).map(|i| make(100 + round * 30 + i)).collect();
+        for d in &batch {
+            docs.insert(d["id"].as_u64().unwrap(), d.clone());
+        }
+        index.add_documents(batch, None, false, 10 + round).unwrap();
+        check(&index, &docs, "old and new segments together");
+    }
+    assert!(index.stats().segments <= 8, "segments: {}", index.stats().segments);
+    drop(index);
+    check(&Index::open(dir.path()).unwrap(), &docs, "reopened");
+}
+
+/// Two bounds on a field are read as one range, and a sorted search starts
+/// at the bound, only where no document has two numbers in the field. A
+/// document with `[5, 900]` has a number from 800 up and a number below 10,
+/// and it is sorted by 5 whichever of the two let it through.
+#[test]
+fn bounds_on_a_field_with_several_numbers() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = Index::create(dir.path(), "b", Some("id".into()), 0).unwrap();
+    let s = Settings { filterable_attributes: vec!["n".into()], sortable_attributes: vec!["n".into()], ..Default::default() };
+    index.update_settings(s, 1).unwrap();
+    let make = |i: u64| {
+        let (a, b) = ((i * 7919) % 1000, (i * 104729) % 1000);
+        // The first 1,500 documents, one segment, have one number each.
+        if i >= 1500 && i.is_multiple_of(3) { json!({"id": i, "n": [a, b]}) } else { json!({"id": i, "n": a}) }
+    };
+    let docs: Vec<Value> = (0..6000u64).map(make).collect();
+    for (task, batch) in docs.chunks(1500).enumerate() {
+        index.add_documents(batch.to_vec(), None, false, task as u64 + 2).unwrap();
+    }
+    assert_eq!(index.stats().segments, 4);
+    let numbers = |d: &Value| -> Vec<u64> {
+        match &d["n"] {
+            Value::Array(items) => items.iter().filter_map(|v| v.as_u64()).collect(),
+            other => other.as_u64().into_iter().collect(),
+        }
+    };
+    for (lo, hi) in [(800u64, 10u64), (300, 400), (0, 1000), (990, 995), (500, 500)] {
+        let matching: Vec<&Value> = docs.iter().filter(|d| numbers(d).iter().any(|n| *n >= lo) && numbers(d).iter().any(|n| *n < hi)).collect();
+        let filter = format!("n >= {lo} AND n < {hi}");
+        let res = index.search(&q(json!({"q": "", "filter": filter, "limit": 0}))).unwrap();
+        assert_eq!(res["estimatedTotalHits"].as_u64().unwrap(), matching.len() as u64, "{filter}");
+        assert_sorted(&index, &matching, Some(&filter), &["n"], "several numbers");
+    }
+    for (filter, keep) in [("n >= 800", (|n| n >= 800) as fn(u64) -> bool), ("n < 10", |n| n < 10), ("n 20 TO 30", |n| (20..=30).contains(&n))] {
+        let matching: Vec<&Value> = docs.iter().filter(|d| numbers(d).into_iter().any(keep)).collect();
+        assert_sorted(&index, &matching, Some(filter), &["n"], "several numbers");
+    }
+}

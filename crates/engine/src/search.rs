@@ -1,8 +1,8 @@
 //! Query execution: term lookup with typo tolerance, bucket-sort ranking,
 //! sorting, facets and hit formatting.
 
-use crate::index::{universe, State};
-use crate::segment::{facet_key, Segment, SortKey, F_FILTER, TAG_NUM, TAG_STR};
+use crate::index::{universe_of, State};
+use crate::segment::{cmp_rank, facet_key, Rank, Segment, SortKey, F_FILTER, TAG_NUM, TAG_STR};
 use crate::settings::{attr_matches, Settings};
 use crate::tokenizer::{tokenize, typo_count};
 use crate::util::decode_f64;
@@ -21,7 +21,18 @@ const MAX_PHRASES: usize = 10;
 const MAX_PHRASE_WORDS: usize = 16;
 /// Facets a single search may ask for.
 const MAX_FACETS: usize = 100;
+/// A query word follows at most this many terms of a segment's dictionary,
+/// or the segment's share of `DERIVATION_BUDGET` by documents if that is
+/// more: an index in one segment follows as many terms as the same index in
+/// eight, so what a search sees does not shrink when segments are merged.
 const MAX_DERIVATIONS: usize = 300;
+const DERIVATION_BUDGET: usize = 2400;
+
+/// How many dictionary terms a query word may follow in a segment holding
+/// `docs` of the `total` documents of its index.
+fn derivation_limit(docs: u64, total: u64) -> usize {
+    MAX_DERIVATIONS.max((DERIVATION_BUDGET as u64 * docs / total.max(1)) as usize)
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -175,6 +186,8 @@ struct WordHits {
     lvl: [RoaringBitmap; 3],
     any: RoaringBitmap,
     per_field: HashMap<u16, RoaringBitmap>,
+    /// The same, for the terms that match the word without a typo.
+    per_field_exact: HashMap<u16, RoaringBitmap>,
     /// Posting offsets of every term this word matched.
     terms: Vec<u64>,
     /// Documents that contain the word exactly as typed, and its postings.
@@ -182,19 +195,19 @@ struct WordHits {
     exact_term: Option<u64>,
 }
 
-fn collect<A: Automaton>(seg: &Segment, aut: A, mut f: impl FnMut(&[u8], u64)) {
+fn collect<A: Automaton>(seg: &Segment, aut: A, limit: usize, mut f: impl FnMut(&[u8], u64)) {
     let mut stream = seg.terms().search(aut).into_stream();
     let mut n = 0;
     while let Some((key, off)) = stream.next() {
         f(key, off);
         n += 1;
-        if n >= MAX_DERIVATIONS {
+        if n >= limit {
             break;
         }
     }
 }
 
-fn word_hits(seg: &Segment, word: &QWord, lev: Option<&Typos>, settings: &Settings, allowed: Option<&HashSet<u16>>) -> Result<WordHits> {
+fn word_hits(seg: &Segment, word: &QWord, lev: Option<&Typos>, settings: &Settings, allowed: Option<&HashSet<u16>>, limit: usize) -> Result<WordHits> {
     let mut derivs: HashMap<u64, usize> = HashMap::new();
     let mut note = |off: u64, typos: usize| {
         let e = derivs.entry(off).or_insert(typos);
@@ -205,7 +218,7 @@ fn word_hits(seg: &Segment, word: &QWord, lev: Option<&Typos>, settings: &Settin
         note(off, 0);
     }
     if word.prefix {
-        collect(seg, Str::new(&word.text).starts_with(), |_, off| note(off, 0));
+        collect(seg, Str::new(&word.text).starts_with(), limit, |_, off| note(off, 0));
     }
     {
         if let Some(lev) = lev {
@@ -215,7 +228,7 @@ fn word_hits(seg: &Segment, word: &QWord, lev: Option<&Typos>, settings: &Settin
                     note(off, typos.min(2));
                 }
             };
-            collect(seg, lev, &mut classify);
+            collect(seg, lev, limit, &mut classify);
         }
     }
     if let Some(syns) = settings.synonyms.get(&word.text) {
@@ -239,6 +252,9 @@ fn word_hits(seg: &Segment, word: &QWord, lev: Option<&Typos>, settings: &Settin
                 hits.exact |= &bm;
             }
             hits.lvl[typos] |= &bm;
+            if typos == 0 {
+                *hits.per_field_exact.entry(fid).or_default() |= &bm;
+            }
             *hits.per_field.entry(fid).or_default() |= bm;
         }
     }
@@ -452,8 +468,13 @@ struct Ctx<'a> {
     /// run (`u32::MAX` otherwise). Above zero, no document of the bucket has
     /// every word in its place, so none starts an attribute with the query.
     position_cost: std::sync::atomic::AtomicU32,
+    /// Whether the bucket being refined is the one the typo rule made of
+    /// the documents that match every word without a typo.
+    no_typos: std::sync::atomic::AtomicBool,
     match_all: bool,
     allowed: Option<HashSet<u16>>,
+    /// Per field, the lowest and the highest number the filter lets through.
+    bounds: HashMap<u16, (Option<f64>, Option<f64>)>,
 }
 
 /// Above this many candidates in a bucket the proximity rule is skipped:
@@ -512,6 +533,13 @@ fn position_cost(distance: u32) -> u8 {
         _ => POSITION_MAX_COST,
     }
 }
+
+/// A sorted search walks a segment's stored order instead of ranking every
+/// candidate when the walk is expected to read at most a `WALK_MARGIN`th as
+/// many entries as there are candidates, and gives up after reading one
+/// entry for every `WALK_COST` candidates.
+const WALK_MARGIN: u64 = 8;
+const WALK_COST: usize = 4;
 
 fn cmp_keys(a: &SortKey, b: &SortKey, asc: bool) -> Ordering {
     let rank = |k: &SortKey| match k {
@@ -604,8 +632,11 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
                 }
                 by_sum = next;
             }
-            for bucket in by_sum {
-                rank(ctx, rest, bucket, k, out, need)?;
+            for (sum, bucket) in by_sum.into_iter().enumerate() {
+                ctx.no_typos.store(sum == 0, std::sync::atomic::Ordering::Relaxed);
+                let done = rank(ctx, rest, bucket, k, out, need);
+                ctx.no_typos.store(false, std::sync::atomic::Ordering::Relaxed);
+                done?;
                 if out.len() >= need {
                     return Ok(());
                 }
@@ -680,12 +711,17 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
                 return rank(ctx, rest, cands, k, out, need);
             };
             let worst = weights.iter().filter(|w| **w != u32::MAX).max().map_or(0, |w| w + 1);
+            let no_typos = ctx.no_typos.load(std::sync::atomic::Ordering::Relaxed);
             let mut parts: BTreeMap<u32, Cands> = BTreeMap::from([(0, cands)]);
             for w in &ctx.words[..k] {
                 // This word's documents per weight, per segment.
                 let mut by_weight: Vec<BTreeMap<u32, RoaringBitmap>> = vec![BTreeMap::new(); nseg];
                 for (s, slot) in by_weight.iter_mut().enumerate() {
-                    for (fid, bm) in &w[s].per_field {
+                    // A document that matches without typos is placed by
+                    // the attributes where it does, not by one that holds
+                    // a misspelling of the word.
+                    let per_field = if no_typos { &w[s].per_field_exact } else { &w[s].per_field };
+                    for (fid, bm) in per_field {
                         let weight = weights.get(*fid as usize).copied().unwrap_or(u32::MAX);
                         if weight != u32::MAX {
                             *slot.entry(weight).or_default() |= bm;
@@ -847,16 +883,32 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
             let want = need - out.len();
             let mut cands = cands;
             if let [fid] = fids[..] {
-                let by_rank = |a: &(u8, f64), b: &(u8, f64)| {
-                    let ord = a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                let by_rank = |a: &Rank, b: &Rank| {
+                    let ord = cmp_rank(a, b);
                     if *asc || a.0 == 2 || b.0 == 2 { ord } else { ord.reverse() }
                 };
                 for (s, bm) in cands.iter_mut().enumerate() {
-                    if bm.len() as usize <= want {
+                    let have = bm.len() as usize;
+                    if have <= want {
                         continue;
                     }
                     let seg = &ctx.st.segs[s].seg;
-                    let mut ranked: Vec<((u8, f64), u32)> = bm.iter().map(|d| (seg.sort_rank(fid, d), d)).collect();
+                    // The segment keeps the documents of the field in sorted
+                    // order. Walking it meets a candidate every `doc_count /
+                    // have` entries when the candidates are spread evenly;
+                    // with few of them, or all of them far from the start,
+                    // reading the rank of each one is cheaper. A filter on
+                    // the same field says where they start, as long as a
+                    // document is sorted by the number that passed it.
+                    let from = ctx.bounds.get(&fid).and_then(|(lo, hi)| if *asc { *lo } else { *hi }).filter(|_| seg.one_number_each(fid));
+                    let expected = (want as u64).saturating_mul(seg.doc_count as u64) / have as u64;
+                    if from.is_some() || expected.saturating_mul(WALK_MARGIN) <= have as u64 {
+                        if let Some(head) = seg.sort_head(fid, bm, want, *asc, from, have / WALK_COST) {
+                            *bm = head;
+                            continue;
+                        }
+                    }
+                    let mut ranked = seg.sort_ranks(fid, bm);
                     ranked.select_nth_unstable_by(want - 1, |a, b| by_rank(&a.0, &b.0));
                     let last = ranked[want - 1].0;
                     *bm = ranked[..want].iter().chain(ranked[want..].iter().filter(|r| by_rank(&r.0, &last) == Ordering::Equal)).map(|r| r.1).collect();
@@ -1098,7 +1150,11 @@ pub fn search(st: &State, q: &SearchQuery) -> Result<Value> {
     };
     let need = offset.saturating_add(limit).min(settings.pagination.max_total_hits);
 
-    let mut cands = universe(st, q.filter.as_ref())?;
+    let filter = match &q.filter {
+        Some(v) => crate::filter::parse_value(v)?,
+        None => None,
+    };
+    let mut cands = universe_of(st, filter.as_ref())?;
     let t_filter = started.elapsed();
     let query = q.q.clone().unwrap_or_default();
     let (words, phrases) = parse_query(&query, settings);
@@ -1110,8 +1166,10 @@ pub fn search(st: &State, q: &SearchQuery) -> Result<Value> {
     let levs: Vec<Option<Typos>> = words.iter().map(Typos::new).collect();
     let nseg = st.segs.len();
     let heavy = !phrases.is_empty() || words.len() > 1;
+    let total_docs: u64 = st.segs.iter().map(|s| s.seg.doc_count as u64).sum();
     let stage = per_segment(nseg, heavy && count(&cands) >= PARALLEL_MIN_DOCS, |s| -> Result<(RoaringBitmap, Vec<WordHits>)> {
         let seg = &st.segs[s].seg;
+        let limit = derivation_limit(seg.doc_count as u64, total_docs);
         let mut cand = cands[s].clone();
         for phrase in &phrases {
             if !cand.is_empty() {
@@ -1120,7 +1178,7 @@ pub fn search(st: &State, q: &SearchQuery) -> Result<Value> {
         }
         let mut found = Vec::with_capacity(words.len());
         for (w, lev) in words.iter().zip(&levs) {
-            found.push(if cand.is_empty() { WordHits::default() } else { word_hits(seg, w, lev.as_ref(), settings, allowed.as_ref())? });
+            found.push(if cand.is_empty() { WordHits::default() } else { word_hits(seg, w, lev.as_ref(), settings, allowed.as_ref(), limit)? });
         }
         Ok((cand, found))
     })?;
@@ -1195,7 +1253,8 @@ pub fn search(st: &State, q: &SearchQuery) -> Result<Value> {
         };
         !std::mem::replace(&mut seen[slot], true)
     });
-    let ctx = Ctx { st, words: hits, weights, position_cost: std::sync::atomic::AtomicU32::new(u32::MAX), match_all, allowed };
+    let bounds = filter.iter().flat_map(crate::filter::bounds).filter_map(|(field, lo, hi)| Some((st.schema.id(field)?, (lo, hi)))).collect();
+    let ctx = Ctx { st, words: hits, weights, position_cost: std::sync::atomic::AtomicU32::new(u32::MAX), no_typos: std::sync::atomic::AtomicBool::new(false), match_all, allowed, bounds };
     let mut ranked = Vec::new();
     let facet_cands = if q.facets.is_some() { Some(cands.clone()) } else { None };
     rank(&ctx, &rules, cands, 0, &mut ranked, need)?;
@@ -1265,4 +1324,20 @@ pub fn search(st: &State, q: &SearchQuery) -> Result<Value> {
         res.insert("facetStats".into(), stats);
     }
     Ok(Value::Object(res))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terms_followed_do_not_depend_on_how_an_index_is_split() {
+        // One segment follows what eight equal ones follow together.
+        assert_eq!(derivation_limit(1_000_000, 1_000_000), 8 * derivation_limit(125_000, 1_000_000));
+        assert_eq!(derivation_limit(125_000, 1_000_000), MAX_DERIVATIONS);
+        // A small segment next to a large one keeps the floor.
+        assert_eq!(derivation_limit(10, 1_000_000), MAX_DERIVATIONS);
+        assert_eq!(derivation_limit(900_000, 1_000_000), 2160);
+        assert_eq!(derivation_limit(0, 0), MAX_DERIVATIONS);
+    }
 }

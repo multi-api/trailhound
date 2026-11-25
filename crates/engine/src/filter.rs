@@ -331,12 +331,92 @@ fn eq(seg: &Segment, fid: u16, value: &str) -> Result<RoaringBitmap> {
     Ok(bm)
 }
 
+type Bound = Option<(f64, bool)>;
+
+/// The conditions that must all hold for `f` to hold.
+fn conjuncts<'a>(f: &'a Filter, out: &mut Vec<&'a Filter>) {
+    match f {
+        Filter::And(parts) => parts.iter().for_each(|p| conjuncts(p, out)),
+        other => out.push(other),
+    }
+}
+
+/// The range that the ranges on `field` among `parts` leave when they must
+/// all hold, or `None` when a bound is not a number that can be compared.
+fn narrowed(parts: &[&Filter], field: &str) -> Option<(Bound, Bound)> {
+    let (mut lo, mut hi): (Bound, Bound) = (None, None);
+    for p in parts {
+        let Filter::Range(f, l, h) = p else { continue };
+        if f != field {
+            continue;
+        }
+        if l.is_some_and(|b| b.0.is_nan()) || h.is_some_and(|b| b.0.is_nan()) {
+            return None;
+        }
+        if let Some((v, incl)) = *l {
+            lo = Some(match lo {
+                Some((w, i)) if w > v => (w, i),
+                Some((w, i)) if w == v => (w, i && incl),
+                _ => (v, incl),
+            });
+        }
+        if let Some((v, incl)) = *h {
+            hi = Some(match hi {
+                Some((w, i)) if w < v => (w, i),
+                Some((w, i)) if w == v => (w, i && incl),
+                _ => (v, incl),
+            });
+        }
+    }
+    Some((lo, hi))
+}
+
+/// Per field, the numbers between which a document must have one to pass
+/// the filter: the lowest and the highest that its ranges allow.
+pub fn bounds(f: &Filter) -> Vec<(&str, Option<f64>, Option<f64>)> {
+    let mut parts = Vec::new();
+    conjuncts(f, &mut parts);
+    let mut out: Vec<(&str, Option<f64>, Option<f64>)> = Vec::new();
+    for p in &parts {
+        let Filter::Range(field, ..) = p else { continue };
+        if out.iter().any(|b| b.0 == field) {
+            continue;
+        }
+        if let Some((lo, hi)) = narrowed(&parts, field) {
+            out.push((field, lo.map(|b| b.0), hi.map(|b| b.0)));
+        }
+    }
+    out
+}
+
 pub fn eval(f: &Filter, seg: &Segment, schema: &Schema, filterable: &[String]) -> Result<RoaringBitmap> {
     Ok(match f {
-        Filter::And(parts) => {
+        Filter::And(_) => {
+            let mut parts = Vec::new();
+            conjuncts(f, &mut parts);
+            let mut merged = vec![false; parts.len()];
             let mut acc: Option<RoaringBitmap> = None;
-            for p in parts {
-                let bm = eval(p, seg, schema, filterable)?;
+            for (i, p) in parts.iter().enumerate() {
+                if merged[i] {
+                    continue;
+                }
+                // `n >= 10 AND n < 20` asks for a number from 10 up and a
+                // number below 20. Where no document has two numbers in the
+                // field that is one number between them: a short range to
+                // read instead of two that each cover most of the segment.
+                let mut one = None;
+                if let Filter::Range(field, ..) = p {
+                    let others = parts.iter().enumerate().skip(i + 1).filter(|(_, o)| matches!(o, Filter::Range(f, ..) if f == field)).count();
+                    if others > 0 && field_ids(schema, filterable, field)?.iter().all(|fid| seg.one_number_each(*fid)) {
+                        if let Some((lo, hi)) = narrowed(&parts, field) {
+                            for (j, o) in parts.iter().enumerate().skip(i + 1) {
+                                merged[j] |= matches!(o, Filter::Range(f, ..) if f == field);
+                            }
+                            one = Some(Filter::Range(field.clone(), lo, hi));
+                        }
+                    }
+                }
+                let bm = eval(one.as_ref().unwrap_or(p), seg, schema, filterable)?;
                 acc = Some(match acc {
                     Some(a) => a & bm,
                     None => bm,
