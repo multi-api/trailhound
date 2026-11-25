@@ -590,6 +590,163 @@ struct Ctx<'a> {
     allowed: Option<HashSet<u16>>,
     /// Per field, the lowest and the highest number the filter lets through.
     bounds: HashMap<u16, (Option<f64>, Option<f64>)>,
+    /// What was read of the positions of the buckets being refined, the
+    /// innermost last: a rule that reads positions leaves it here for the
+    /// rules after it, which see parts of the same candidates.
+    read: std::sync::Mutex<Vec<std::sync::Arc<Positions>>>,
+}
+
+/// What the rules that read positions need to know of a set of candidates
+/// holding `k` of the query words. It comes from one pass over the posting
+/// lists: proximity, word position and exactness used to make one each, and
+/// the lists of common words are long.
+struct Positions {
+    k: usize,
+    /// By segment.
+    segs: Vec<SegPositions>,
+}
+
+#[derive(Default)]
+struct SegPositions {
+    /// The candidates, in ascending order.
+    docs: Vec<u32>,
+    /// For each one: how far its words are from their place in the query,
+    /// added up, and their proximity when it was asked for.
+    cost: Vec<u8>,
+    prox: Vec<u32>,
+    /// Those that hold every query word, exactly as typed, at its place in
+    /// the query. Empty when `k` is not the whole query.
+    starts: RoaringBitmap,
+}
+
+impl Positions {
+    /// One pass over the positions of `cands`.
+    fn read(ctx: &Ctx, cands: &Cands, k: usize, with_proximity: bool) -> Result<Positions> {
+        let spreading = count(cands) >= PARALLEL_MIN_DOCS;
+        let whole = k == ctx.words.len();
+        let parts = pieces(cands, spreading);
+        let read = per_piece(parts.len(), spreading, |t| -> Result<SegPositions> {
+            let (s, piece) = (parts[t].0, &*parts[t].1);
+            let seg = &ctx.st.segs[s].seg;
+            let want: Vec<u32> = piece.iter().collect();
+            let size = want.len();
+            let mut cost = vec![0u8; size];
+            let mut starts = vec![whole; size];
+            // Per word: every (document, field, position) where it matches.
+            let mut occ: Vec<Vec<(u32, u16, u32)>> = Vec::new();
+            for (i, w) in ctx.words[..k].iter().enumerate() {
+                let place = bucketed_position(i as u32);
+                let mut best = vec![POSITION_MAX_COST; size];
+                let mut placed = vec![false; size];
+                let mut found = Vec::new();
+                for off in &w[s].terms {
+                    let exact = whole && w[s].exact_term == Some(*off);
+                    for (fid, docs, pos_off) in seg.postings(*off)? {
+                        if ctx.allowed.as_ref().is_some_and(|a| !a.contains(&fid)) || docs.is_disjoint(piece) {
+                            continue;
+                        }
+                        seg.scan_positions(pos_off, &docs, &want, |idx, p| {
+                            let at = bucketed_position(p);
+                            let far = position_cost(at.abs_diff(i as u32));
+                            if far < best[idx] {
+                                best[idx] = far;
+                            }
+                            if exact && at == place {
+                                placed[idx] = true;
+                            }
+                            if with_proximity {
+                                found.push((want[idx], fid, p));
+                            }
+                        })?;
+                    }
+                }
+                for idx in 0..size {
+                    cost[idx] += best[idx];
+                    starts[idx] &= placed[idx];
+                }
+                if with_proximity {
+                    if found.windows(2).any(|w| w[0] > w[1]) {
+                        found.sort_unstable();
+                    }
+                    occ.push(found);
+                }
+            }
+            let mut prox = Vec::new();
+            if with_proximity {
+                prox.reserve(size);
+                let mut at = vec![0usize; k];
+                let mut slices: Vec<&[(u32, u16, u32)]> = Vec::with_capacity(k);
+                for &d in &want {
+                    slices.clear();
+                    for (i, list) in occ.iter().enumerate() {
+                        while at[i] < list.len() && list[at[i]].0 < d {
+                            at[i] += 1;
+                        }
+                        let start = at[i];
+                        while at[i] < list.len() && list[at[i]].0 == d {
+                            at[i] += 1;
+                        }
+                        slices.push(&list[start..at[i]]);
+                    }
+                    prox.push(proximity(&slices));
+                }
+            }
+            let starts = want.iter().zip(&starts).filter(|(_, placed)| **placed).map(|(d, _)| *d).collect();
+            Ok(SegPositions { docs: want, cost, prox, starts })
+        })?;
+        // The pieces of a segment come in ascending order of documents.
+        let mut segs: Vec<SegPositions> = cands.iter().map(|_| SegPositions::default()).collect();
+        for ((s, _), part) in parts.iter().zip(read) {
+            let seg = &mut segs[*s];
+            if seg.docs.is_empty() {
+                *seg = part;
+            } else {
+                seg.docs.extend(part.docs);
+                seg.cost.extend(part.cost);
+                seg.prox.extend(part.prox);
+                seg.starts |= part.starts;
+            }
+        }
+        Ok(Positions { k, segs })
+    }
+
+    /// `cands` split by a value read for each of them, or `None` if one of
+    /// them was not read.
+    fn split(&self, cands: &Cands, value: impl Fn(&SegPositions, usize) -> u32) -> Option<BTreeMap<u32, Cands>> {
+        let nseg = cands.len();
+        let mut buckets: BTreeMap<u32, Cands> = BTreeMap::new();
+        for (s, bm) in cands.iter().enumerate() {
+            let seg = &self.segs[s];
+            let mut at = 0;
+            for d in bm {
+                while at < seg.docs.len() && seg.docs[at] < d {
+                    at += 1;
+                }
+                if seg.docs.get(at) != Some(&d) {
+                    return None;
+                }
+                // Documents come in ascending order: append, do not search.
+                buckets.entry(value(seg, at)).or_insert_with(|| vec![RoaringBitmap::new(); nseg])[s].push(d);
+            }
+        }
+        Some(buckets)
+    }
+}
+
+impl Ctx<'_> {
+    /// What an earlier rule read of the candidates being refined, when it
+    /// read them for the same number of words.
+    fn positions(&self, k: usize) -> Option<std::sync::Arc<Positions>> {
+        self.read.lock().unwrap().last().filter(|p| p.k == k).cloned()
+    }
+
+    /// Runs `f` with `read` at hand for the rules it calls.
+    fn with_positions<T>(&self, read: std::sync::Arc<Positions>, f: impl FnOnce() -> T) -> T {
+        self.read.lock().unwrap().push(read);
+        let out = f();
+        self.read.lock().unwrap().pop();
+        out
+    }
 }
 
 /// Above this many candidates in a bucket the proximity rule is skipped:
@@ -605,13 +762,24 @@ const MAX_PROXIMITY: u32 = 4;
 fn proximity(occ: &[&[(u32, u16, u32)]]) -> u32 {
     let mut total = 0;
     for pair in occ.windows(2) {
+        // Both lists are sorted by field and position, so the closest
+        // partner of an occurrence is the last one at or before it or the
+        // first one after it.
+        let (first, second) = (pair[0], pair[1]);
         let mut best = MAX_PROXIMITY;
-        for a in pair[0] {
-            for b in pair[1] {
-                if a.1 == b.1 {
-                    let d = if b.2 > a.2 { b.2 - a.2 } else { a.2 - b.2 + 1 };
-                    best = best.min(d);
-                }
+        let mut next = 0;
+        for a in first {
+            while next < second.len() && (second[next].1, second[next].2) <= (a.1, a.2) {
+                next += 1;
+            }
+            if let Some(b) = second.get(next).filter(|b| b.1 == a.1) {
+                best = best.min(b.2 - a.2);
+            }
+            if let Some(b) = next.checked_sub(1).map(|at| second[at]).filter(|b| b.1 == a.1) {
+                best = best.min(a.2 - b.2 + 1);
+            }
+            if best <= 1 {
+                break;
             }
         }
         total += best;
@@ -762,62 +930,19 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
                 return rank(ctx, rest, cands, k, out, need);
             }
             let t_prof = std::time::Instant::now();
-            let parts = pieces(&cands, total >= PARALLEL_MIN_DOCS);
-            let grouped = per_piece(parts.len(), total >= PARALLEL_MIN_DOCS, |t| -> Result<BTreeMap<u32, RoaringBitmap>> {
-                let mut groups: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
-                let (s, piece) = (parts[t].0, &*parts[t].1);
-                let seg = &ctx.st.segs[s].seg;
-                let want: Vec<u32> = piece.iter().collect();
-                // Per word: every (document, field, position) where it matches.
-                let mut occ: Vec<Vec<(u32, u16, u32)>> = Vec::with_capacity(k);
-                for w in &ctx.words[..k] {
-                    let mut found = Vec::new();
-                    for off in &w[s].terms {
-                        for (fid, docs, pos_off) in seg.postings(*off)? {
-                            if ctx.allowed.as_ref().is_some_and(|a| !a.contains(&fid)) || docs.is_disjoint(piece) {
-                                continue;
-                            }
-                            seg.scan_positions(pos_off, &docs, &want, |w, p| found.push((want[w], fid, p)))?;
-                        }
-                    }
-                    if found.windows(2).any(|w| w[0] > w[1]) {
-                        found.sort_unstable();
-                    }
-                    occ.push(found);
-                }
-                let mut at = vec![0usize; k];
-                let mut slices: Vec<&[(u32, u16, u32)]> = Vec::with_capacity(k);
-                for &d in &want {
-                    slices.clear();
-                    for (i, list) in occ.iter().enumerate() {
-                        while at[i] < list.len() && list[at[i]].0 < d {
-                            at[i] += 1;
-                        }
-                        let start = at[i];
-                        while at[i] < list.len() && list[at[i]].0 == d {
-                            at[i] += 1;
-                        }
-                        slices.push(&list[start..at[i]]);
-                    }
-                    // Documents come in ascending order: append, do not search.
-                    groups.entry(proximity(&slices)).or_default().push(d);
-                }
-                Ok(groups)
-            })?;
+            let read = std::sync::Arc::new(Positions::read(ctx, &cands, k, true)?);
             prof(0, t_prof);
-            let mut buckets: BTreeMap<u32, Cands> = BTreeMap::new();
-            for ((s, _), groups) in parts.iter().zip(grouped) {
-                for (prox, docs) in groups {
-                    buckets.entry(prox).or_insert_with(|| vec![RoaringBitmap::new(); nseg])[*s] |= docs;
+            let buckets = read.split(&cands, |seg, at| seg.prox[at]).ok_or_else(|| Error::corrupt("a candidate was not read"))?;
+            drop(cands);
+            return ctx.with_positions(read, || {
+                for (_, bucket) in buckets {
+                    rank(ctx, rest, bucket, k, out, need)?;
+                    if out.len() >= need {
+                        break;
+                    }
                 }
-            }
-            drop(parts);
-            for (_, bucket) in buckets {
-                rank(ctx, rest, bucket, k, out, need)?;
-                if out.len() >= need {
-                    return Ok(());
-                }
-            }
+                Ok(())
+            });
         }
         Rule::AttributeRank => {
             // Cost of a document: for every query word, the weight of the
@@ -878,55 +1003,33 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
             // Cost of a document: for every query word, how far its best
             // occurrence is from where the word sits in the query, added up.
             let t_prof = std::time::Instant::now();
-            let parts = pieces(&cands, total >= PARALLEL_MIN_DOCS);
-            let grouped = per_piece(parts.len(), total >= PARALLEL_MIN_DOCS, |t| -> Result<BTreeMap<u32, RoaringBitmap>> {
-                let mut groups: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
-                let (s, piece) = (parts[t].0, &*parts[t].1);
-                let want: Vec<u32> = piece.iter().collect();
-                let size = want.len();
-                let seg = &ctx.st.segs[s].seg;
-                let mut sum = vec![0u8; size];
-                for (i, w) in ctx.words[..k].iter().enumerate() {
-                    let mut best = vec![POSITION_MAX_COST; size];
-                    for off in &w[s].terms {
-                        for (fid, docs, pos_off) in seg.postings(*off)? {
-                            if ctx.allowed.as_ref().is_some_and(|a| !a.contains(&fid)) || docs.is_disjoint(piece) {
-                                continue;
-                            }
-                            seg.scan_positions(pos_off, &docs, &want, |idx, p| {
-                                let cost = position_cost(bucketed_position(p).abs_diff(i as u32));
-                                if cost < best[idx] {
-                                    best[idx] = cost;
-                                }
-                            })?;
-                        }
-                    }
-                    for (total, b) in sum.iter_mut().zip(&best) {
-                        *total += *b;
-                    }
+            let known = ctx.positions(k).and_then(|read| read.split(&cands, |seg, at| seg.cost[at] as u32).map(|buckets| (None, buckets)));
+            let (read, buckets) = match known {
+                Some(found) => found,
+                None => {
+                    let read = std::sync::Arc::new(Positions::read(ctx, &cands, k, false)?);
+                    let buckets = read.split(&cands, |seg, at| seg.cost[at] as u32).ok_or_else(|| Error::corrupt("a candidate was not read"))?;
+                    (Some(read), buckets)
                 }
-                for (idx, d) in want.iter().enumerate() {
-                    groups.entry(sum[idx] as u32).or_default().push(*d);
-                }
-                Ok(groups)
-            })?;
+            };
             prof(1, t_prof);
-            let mut buckets: BTreeMap<u32, Cands> = BTreeMap::new();
-            for ((s, _), groups) in parts.iter().zip(grouped) {
-                for (cost, docs) in groups {
-                    buckets.entry(cost).or_insert_with(|| vec![RoaringBitmap::new(); nseg])[*s] |= docs;
+            drop(cands);
+            let refine = || {
+                for (cost, bucket) in buckets {
+                    ctx.position_cost.store(cost, std::sync::atomic::Ordering::Relaxed);
+                    let done = rank(ctx, rest, bucket, k, out, need);
+                    ctx.position_cost.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+                    done?;
+                    if out.len() >= need {
+                        break;
+                    }
                 }
-            }
-            drop(parts);
-            for (cost, bucket) in buckets {
-                ctx.position_cost.store(cost, std::sync::atomic::Ordering::Relaxed);
-                let done = rank(ctx, rest, bucket, k, out, need);
-                ctx.position_cost.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-                done?;
-                if out.len() >= need {
-                    return Ok(());
-                }
-            }
+                Ok(())
+            };
+            return match read {
+                Some(read) => ctx.with_positions(read, refine),
+                None => refine(),
+            };
         }
         Rule::Exactness => {
             if k == 0 {
@@ -939,7 +1042,11 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
             let placed = matches!(ctx.position_cost.load(std::sync::atomic::Ordering::Relaxed), 0 | u32::MAX);
             let whole_query = placed && k == ctx.words.len() && total <= PROXIMITY_MAX_DOCS;
             let mut starts: Cands = vec![RoaringBitmap::new(); nseg];
-            if whole_query {
+            if let Some(read) = ctx.positions(k).filter(|_| whole_query) {
+                for (s, known) in read.segs.iter().enumerate() {
+                    starts[s] = &cands[s] & &known.starts;
+                }
+            } else if whole_query {
                 let parts = pieces(&cands, total >= PARALLEL_MIN_DOCS);
                 let found = per_piece(parts.len(), total >= PARALLEL_MIN_DOCS, |t| -> Result<RoaringBitmap> {
                     let s = parts[t].0;
@@ -1398,7 +1505,7 @@ pub fn search(st: &State, q: &SearchQuery) -> Result<Value> {
         !std::mem::replace(&mut seen[slot], true)
     });
     let bounds = filter.iter().flat_map(crate::filter::bounds).filter_map(|(field, lo, hi)| Some((st.schema.id(field)?, (lo, hi)))).collect();
-    let ctx = Ctx { st, words: hits, weights, position_cost: std::sync::atomic::AtomicU32::new(u32::MAX), no_typos: std::sync::atomic::AtomicBool::new(false), match_all, allowed, bounds };
+    let ctx = Ctx { st, words: hits, weights, position_cost: std::sync::atomic::AtomicU32::new(u32::MAX), no_typos: std::sync::atomic::AtomicBool::new(false), match_all, allowed, bounds, read: Default::default() };
     let mut ranked = Vec::new();
     let facet_cands = if q.facets.is_some() { Some(cands.clone()) } else { None };
     rank(&ctx, &rules, cands, 0, &mut ranked, need)?;
@@ -1483,6 +1590,41 @@ mod tests {
         assert_eq!(derivation_limit(10, 1_000_000), MAX_DERIVATIONS);
         assert_eq!(derivation_limit(900_000, 1_000_000), 2160);
         assert_eq!(derivation_limit(0, 0), MAX_DERIVATIONS);
+    }
+
+    #[test]
+    fn proximity_is_the_closest_pair_of_each_two_words() {
+        // Every pair in the same field, the slow way.
+        let slow = |occ: &[&[(u32, u16, u32)]]| -> u32 {
+            occ.windows(2)
+                .map(|pair| {
+                    let mut best = MAX_PROXIMITY;
+                    for a in pair[0] {
+                        for b in pair[1].iter().filter(|b| b.1 == a.1) {
+                            best = best.min(if b.2 > a.2 { b.2 - a.2 } else { a.2 - b.2 + 1 });
+                        }
+                    }
+                    best
+                })
+                .sum()
+        };
+        let mut seed = 11u64;
+        let mut next = |below: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % below
+        };
+        for _ in 0..2000 {
+            let words: Vec<Vec<(u32, u16, u32)>> = (0..2 + next(3))
+                .map(|_| {
+                    let mut list: Vec<(u32, u16, u32)> = (0..next(6)).map(|_| (7, next(3) as u16, next(12) as u32)).collect();
+                    list.sort_unstable();
+                    list.dedup();
+                    list
+                })
+                .collect();
+            let slices: Vec<&[(u32, u16, u32)]> = words.iter().map(|w| w.as_slice()).collect();
+            assert_eq!(proximity(&slices), slow(&slices), "{words:?}");
+        }
     }
 
     #[test]
