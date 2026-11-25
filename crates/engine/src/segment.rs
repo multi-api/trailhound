@@ -22,7 +22,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-const MAGIC: &[u8; 8] = b"THSEG001";
+const MAGIC: &[u8; 8] = b"THSEG002";
+/// The previous format, which is still read. Its sort columns come without
+/// the documents in sorted order; a merge writes them.
+const MAGIC_V1: &[u8; 8] = b"THSEG001";
 /// Reading one document decompresses its whole block: small blocks keep
 /// that cheap, at the price of a slightly lower compression ratio.
 const BLOCK_SIZE: usize = 16 * 1024;
@@ -41,6 +44,9 @@ const S_POS: usize = 9;
 /// Position gap between two values of the same field, so that phrases and
 /// proximity never span separate values.
 const VALUE_GAP: u32 = 8;
+/// A merge lets go of the pages of its inputs every time it has written
+/// this much.
+const RELIEF_EVERY: u64 = 32 << 20;
 
 pub const TAG_EXISTS: u8 = 1;
 pub const TAG_NULL: u8 = 2;
@@ -187,6 +193,79 @@ struct SortColMeta {
     ord: Option<(u64, u64)>,
     stroffs: (u64, u64),
     strdata: (u64, u64),
+    /// The documents that have a value, as `u32` ids in ascending order of
+    /// it: numbers, then strings, and by id where the values are equal.
+    #[serde(default)]
+    order: Option<(u64, u64)>,
+}
+
+/// A document's place in the order of a sort column: 0 and its number, 1 and
+/// the rank of its string among the segment's strings, or 2 without a value.
+pub type Rank = (u8, f64);
+
+pub fn cmp_rank(a: &Rank, b: &Rank) -> std::cmp::Ordering {
+    a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn col_num(buf: &[u8], col: &SortColMeta, d: usize) -> f64 {
+    match col.num {
+        Some((off, _)) => {
+            let p = off as usize + d * 8;
+            f64::from_le_bytes(buf[p..p + 8].try_into().unwrap())
+        }
+        None => f64::NAN,
+    }
+}
+
+fn col_ord(buf: &[u8], col: &SortColMeta, d: usize) -> u32 {
+    match col.ord {
+        Some((off, _)) => {
+            let p = off as usize + d * 4;
+            u32::from_le_bytes(buf[p..p + 4].try_into().unwrap())
+        }
+        None => u32::MAX,
+    }
+}
+
+fn col_rank(buf: &[u8], col: &SortColMeta, d: usize) -> Rank {
+    let f = col_num(buf, col, d);
+    if !f.is_nan() {
+        return (0, f);
+    }
+    match col_ord(buf, col, d) {
+        u32::MAX => (2, 0.0),
+        ord => (1, ord as f64),
+    }
+}
+
+/// The documents of a column that have a value, in the order of `col_rank`.
+fn sorted_docs(buf: &[u8], col: &SortColMeta, n: usize) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..n as u32).filter(|d| col_rank(buf, col, *d as usize).0 != 2).collect();
+    order.sort_unstable_by(|a, b| cmp_rank(&col_rank(buf, col, *a as usize), &col_rank(buf, col, *b as usize)).then(a.cmp(b)));
+    order
+}
+
+/// The sorted order of one column: read from the file, or worked out for a
+/// segment written before the order was stored.
+enum Order<'a> {
+    Stored(&'a [u8]),
+    Built(Vec<u32>),
+}
+
+impl Order<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Order::Stored(b) => b.len() / 4,
+            Order::Built(v) => v.len(),
+        }
+    }
+
+    fn get(&self, i: usize) -> u32 {
+        match self {
+            Order::Stored(b) => u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap()),
+            Order::Built(v) => v[i],
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -194,6 +273,10 @@ struct MetaFile {
     doc_count: u32,
     field_counts: Vec<(u16, u32)>,
     sort: Vec<(u16, SortColMeta)>,
+    /// The filterable fields in which some document holds more than one
+    /// number. Absent from segments written before it was recorded.
+    #[serde(default)]
+    multi_num: Option<Vec<u16>>,
 }
 
 /// Postings of one term in one field while a segment is being built, in a
@@ -502,6 +585,9 @@ pub struct SegmentBuilder {
     sort: BTreeMap<u16, SortBuild>,
     counts: BTreeMap<u16, u32>,
     last_seen: HashMap<u16, u32>,
+    /// Per filterable field, the last document that held a number in it.
+    last_num: HashMap<u16, u32>,
+    multi_num: BTreeSet<u16>,
 }
 
 impl SegmentBuilder {
@@ -529,6 +615,8 @@ impl SegmentBuilder {
             sort: BTreeMap::new(),
             counts: BTreeMap::new(),
             last_seen: HashMap::new(),
+            last_num: HashMap::new(),
+            multi_num: BTreeSet::new(),
         })
     }
 
@@ -652,6 +740,9 @@ impl SegmentBuilder {
                     if let Some(f) = n.as_f64() {
                         let f = if f == 0.0 { 0.0 } else { f };
                         self.add_facet(fid, TAG_NUM, &encode_f64(f), "", docid);
+                        if self.last_num.insert(fid, docid) == Some(docid) {
+                            self.multi_num.insert(fid);
+                        }
                     }
                 }
                 Value::String(s) => {
@@ -792,7 +883,7 @@ impl SegmentBuilder {
         secs[S_PKS] = self.section(&fst.into_inner()?)?;
 
         let (sort, sort_meta) = encode_sort(self.n as usize, std::mem::take(&mut self.sort));
-        let meta = MetaFile { doc_count: self.n, field_counts: self.counts.iter().map(|(k, v)| (*k, *v)).collect(), sort: sort_meta };
+        let meta = MetaFile { doc_count: self.n, field_counts: self.counts.iter().map(|(k, v)| (*k, *v)).collect(), sort: sort_meta, multi_num: Some(self.multi_num.iter().copied().collect()) };
         secs[S_SORT] = self.section(&sort)?;
         secs[S_META] = self.section(&serde_json::to_vec(&meta)?)?;
         secs[S_POS] = self.section(&positions)?;
@@ -853,6 +944,11 @@ fn encode_sort(n: usize, cols: BTreeMap<u16, SortBuild>) -> (Vec<u8>, Vec<(u16, 
             m.stroffs = (offs_at as u64, (sort.len() - offs_at) as u64);
             m.strdata = (sort.len() as u64, data.len() as u64);
             sort.extend_from_slice(&data);
+        }
+        let order = sorted_docs(&sort, &m, n);
+        m.order = Some((sort.len() as u64, (order.len() * 4) as u64));
+        for d in order {
+            sort.extend_from_slice(&d.to_le_bytes());
         }
         metas.push((fid, m));
     }
@@ -917,10 +1013,16 @@ impl Spill {
         Ok(())
     }
 
-    fn move_into(mut self, sink: &mut Sink) -> Result<(u64, u64, u32)> {
+    fn move_into(self, sink: &mut Sink) -> Result<(u64, u64, u32)> {
+        sink.begin();
+        self.append_to(sink)?;
+        Ok(sink.end())
+    }
+
+    /// Copy the side file to the end of the section being written.
+    fn append_to(mut self, sink: &mut Sink) -> Result<u64> {
         self.file.flush()?;
         drop(self.file);
-        sink.begin();
         let mut src = File::open(&self.path)?;
         let mut buf = vec![0u8; 1 << 16];
         loop {
@@ -932,7 +1034,7 @@ impl Spill {
         }
         drop(src);
         let _ = std::fs::remove_file(&self.path);
-        Ok(sink.end())
+        Ok(self.len)
     }
 }
 
@@ -984,6 +1086,165 @@ fn flush_merged_block(sink: &mut Sink, block: &mut Vec<u8>, docidx: &mut Vec<u8>
     Ok(())
 }
 
+/// Write one sort column of a merge. New ids follow the inputs one after
+/// another, so the values are copied input by input and the sorted order is
+/// the inputs' orders merged; the distinct strings are merged the same way.
+/// Nothing is held per document: only, per input, where each of its distinct
+/// strings went.
+fn merge_sort_column(inputs: &[MergeInput], remap: &[Vec<u32>], fid: u16, sink: &mut Sink, path: &Path) -> Result<SortColMeta> {
+    const CHUNK: usize = 1 << 16;
+    let k = inputs.len();
+    let none = SortColMeta::default();
+    let cols: Vec<&SortColMeta> = inputs.iter().map(|inp| inp.seg.sortcols.get(&fid).unwrap_or(&none)).collect();
+    let bufs: Vec<&[u8]> = inputs.iter().map(|inp| inp.seg.sort.as_ref()).collect();
+    let live = |i: usize| remap[i].iter().enumerate().filter(|(_, new)| **new != u32::MAX).map(|(d, _)| d);
+    let mut m = SortColMeta::default();
+    let mut out: Vec<u8> = Vec::with_capacity(CHUNK + 8);
+
+    // Numbers.
+    if (0..k).any(|i| cols[i].num.is_some() && live(i).any(|d| !col_num(bufs[i], cols[i], d).is_nan())) {
+        let off = sink.pos - sink.start;
+        for i in 0..k {
+            for d in live(i) {
+                out.extend_from_slice(&col_num(bufs[i], cols[i], d).to_le_bytes());
+                if out.len() >= CHUNK {
+                    sink.write_all(&out)?;
+                    out.clear();
+                }
+            }
+        }
+        sink.write_all(&out)?;
+        out.clear();
+        m.num = Some((off, sink.pos - sink.start - off));
+    }
+
+    // Strings. `ords[i][old]` is the new place of a string of input `i`, or
+    // u32::MAX when no surviving document has it.
+    let string_at = |i: usize, ord: usize| -> &[u8] {
+        let o = cols[i].stroffs.0 as usize + ord * 4;
+        let a = u32::from_le_bytes(bufs[i][o..o + 4].try_into().unwrap()) as usize;
+        let b = u32::from_le_bytes(bufs[i][o + 4..o + 8].try_into().unwrap()) as usize;
+        let base = cols[i].strdata.0 as usize;
+        &bufs[i][base + a..base + b]
+    };
+    let mut ords: Vec<Vec<u32>> = Vec::with_capacity(k);
+    for i in 0..k {
+        let mut used = Vec::new();
+        if cols[i].ord.is_some() {
+            used = vec![u32::MAX; (cols[i].stroffs.1 as usize / 4).saturating_sub(1)];
+            for d in live(i) {
+                let ord = col_ord(bufs[i], cols[i], d);
+                if ord != u32::MAX {
+                    *used.get_mut(ord as usize).ok_or_else(|| Error::corrupt("bad sort value"))? = 0;
+                }
+            }
+        }
+        ords.push(used);
+    }
+    if ords.iter().any(|used| used.contains(&0)) {
+        let mut offs = Spill::create(path.with_extension("soff.tmp"))?;
+        let mut data = Spill::create(path.with_extension("sstr.tmp"))?;
+        let skip = |used: &[u32], mut at: usize| {
+            while at < used.len() && used[at] == u32::MAX {
+                at += 1;
+            }
+            at
+        };
+        let mut heads: Vec<usize> = ords.iter().map(|used| skip(used, 0)).collect();
+        let mut next = 0u32;
+        loop {
+            let mut best: Option<&[u8]> = None;
+            for i in 0..k {
+                if heads[i] < ords[i].len() {
+                    let s = string_at(i, heads[i]);
+                    if best.is_none_or(|b| s < b) {
+                        best = Some(s);
+                    }
+                }
+            }
+            let Some(best) = best else { break };
+            if data.len + best.len() as u64 > u32::MAX as u64 {
+                return Err(Error::corrupt("the strings of a sortable field do not fit in a segment"));
+            }
+            offs.put(&(data.len as u32).to_le_bytes())?;
+            data.put(best)?;
+            for i in 0..k {
+                if heads[i] < ords[i].len() && string_at(i, heads[i]) == best {
+                    ords[i][heads[i]] = next;
+                    heads[i] = skip(&ords[i], heads[i] + 1);
+                }
+            }
+            next += 1;
+        }
+        offs.put(&(data.len as u32).to_le_bytes())?;
+
+        let off = sink.pos - sink.start;
+        for i in 0..k {
+            for d in live(i) {
+                let new = match col_ord(bufs[i], cols[i], d) {
+                    u32::MAX => u32::MAX,
+                    ord => ords[i][ord as usize],
+                };
+                out.extend_from_slice(&new.to_le_bytes());
+                if out.len() >= CHUNK {
+                    sink.write_all(&out)?;
+                    out.clear();
+                }
+            }
+        }
+        sink.write_all(&out)?;
+        out.clear();
+        m.ord = Some((off, sink.pos - sink.start - off));
+        let off = sink.pos - sink.start;
+        m.stroffs = (off, offs.append_to(sink)?);
+        let off = sink.pos - sink.start;
+        m.strdata = (off, data.append_to(sink)?);
+    }
+
+    // The sorted order: the inputs' orders, merged. A string compares by its
+    // place among the merged strings.
+    let orders: Vec<Order> = inputs.iter().map(|inp| inp.seg.order(fid)).collect();
+    let mut at = vec![0usize; k];
+    let mut advance = |i: usize| -> Option<(Rank, u32)> {
+        while at[i] < orders[i].len() {
+            let d = orders[i].get(at[i]) as usize;
+            at[i] += 1;
+            let new = remap[i][d];
+            if new != u32::MAX {
+                let rank = match col_rank(bufs[i], cols[i], d) {
+                    (1, ord) => (1, ords[i][ord as usize] as f64),
+                    other => other,
+                };
+                return Some((rank, new));
+            }
+        }
+        None
+    };
+    let mut heads: Vec<Option<(Rank, u32)>> = (0..k).map(&mut advance).collect();
+    let off = sink.pos - sink.start;
+    loop {
+        let mut best: Option<usize> = None;
+        for i in 0..k {
+            if let Some(h) = &heads[i] {
+                // Equal values keep the order of the inputs, which is that of the new ids.
+                if best.is_none_or(|b| cmp_rank(&h.0, &heads[b].as_ref().unwrap().0) == std::cmp::Ordering::Less) {
+                    best = Some(i);
+                }
+            }
+        }
+        let Some(i) = best else { break };
+        out.extend_from_slice(&heads[i].unwrap().1.to_le_bytes());
+        if out.len() >= CHUNK {
+            sink.write_all(&out)?;
+            out.clear();
+        }
+        heads[i] = advance(i);
+    }
+    sink.write_all(&out)?;
+    m.order = Some((off, sink.pos - sink.start - off));
+    Ok(m)
+}
+
 /// Merge segments into one without re-indexing: documents are copied block
 /// by block and the term, filter and key dictionaries are merged as sorted
 /// streams, dropping deleted documents on the way. Memory use depends on the
@@ -1010,6 +1271,18 @@ pub fn merge(inputs: &[MergeInput], schema: &Schema, path: &Path, level: i32) ->
     let mut sink = Sink { file: BufWriter::new(File::create(&tmp)?), pos: 0, start: 0, crc: crc32fast::Hasher::new() };
     sink.write_all(MAGIC)?;
     let mut secs = [(0u64, 0u64, 0u32); N_SECTIONS];
+    // A merge reads its inputs from end to end. The pages it has been
+    // through are let go as it advances, so that it holds a few megabytes of
+    // them whatever the size of the segments.
+    let mut released = 0u64;
+    let mut relief = |written: u64| {
+        if written.saturating_sub(released) >= RELIEF_EVERY {
+            released = written;
+            for inp in inputs {
+                inp.seg.release_pages();
+            }
+        }
+    };
 
     // Documents.
     sink.begin();
@@ -1037,6 +1310,7 @@ pub fn merge(inputs: &[MergeInput], schema: &Schema, path: &Path, level: i32) ->
                 docidx.extend_from_slice(&(written + first).to_le_bytes());
                 docidx.extend_from_slice(&crc.to_le_bytes());
                 sink.write_all(comp)?;
+                relief(sink.pos);
             }
             written += inp.seg.doc_count;
             block_first = written;
@@ -1058,6 +1332,7 @@ pub fn merge(inputs: &[MergeInput], schema: &Schema, path: &Path, level: i32) ->
             if block.len() >= BLOCK_SIZE {
                 flush_merged_block(&mut sink, &mut block, &mut docidx, block_first, level)?;
                 block_first = written;
+                relief(sink.pos);
             }
             Ok(())
         })?;
@@ -1068,6 +1343,7 @@ pub fn merge(inputs: &[MergeInput], schema: &Schema, path: &Path, level: i32) ->
 
     // Terms: the dictionary goes straight to the file, postings and
     // positions to side files.
+    let docs_end = sink.pos;
     let mut post = Spill::create(path.with_extension("post.tmp"))?;
     let mut positions = Spill::create(path.with_extension("pos.tmp"))?;
     sink.begin();
@@ -1079,36 +1355,55 @@ pub fn merge(inputs: &[MergeInput], schema: &Schema, path: &Path, level: i32) ->
         }
         let mut union = op.union();
         let mut rec = Vec::new();
+        let mut body = Vec::new();
         while let Some((term, ivs)) = union.next() {
             let mut ivs: Vec<(usize, u64)> = ivs.iter().map(|iv| (iv.index, iv.value)).collect();
             ivs.sort_unstable();
-            let mut fields: BTreeMap<u16, (RoaringBitmap, Vec<u8>)> = BTreeMap::new();
+            let mut lists = Vec::with_capacity(ivs.len());
             for (i, off) in ivs {
-                for (fid, docs, pos_off) in inputs[i].seg.postings(off)? {
-                    let entry = fields.entry(fid).or_default();
-                    inputs[i].seg.raw_positions(pos_off, &docs, |doc, bytes| {
-                        let new = remap[i][doc as usize];
-                        if new != u32::MAX {
-                            entry.0.push(new);
-                            entry.1.extend_from_slice(bytes);
-                        }
-                    })?;
-                }
+                lists.push((i, inputs[i].seg.postings(off)?));
             }
-            fields.retain(|_, f| !f.0.is_empty());
-            if fields.is_empty() {
+            // Field by field, the positions of each input go straight to
+            // the side file: new ids follow the inputs in order, so nothing
+            // but the set of documents has to be put together in memory.
+            let fids: BTreeSet<u16> = lists.iter().flat_map(|(_, list)| list.iter().map(|p| p.0)).collect();
+            let mut fields = 0u64;
+            body.clear();
+            for fid in fids {
+                let start = positions.len;
+                let mut docs = RoaringBitmap::new();
+                let mut failed = None;
+                for (i, list) in &lists {
+                    for (_, theirs, pos_off) in list.iter().filter(|p| p.0 == fid) {
+                        inputs[*i].seg.raw_positions(*pos_off, theirs, |doc, bytes| {
+                            let new = remap[*i][doc as usize];
+                            if new != u32::MAX && failed.is_none() {
+                                docs.push(new);
+                                failed = positions.put(bytes).err();
+                            }
+                        })?;
+                    }
+                }
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+                if docs.is_empty() {
+                    continue;
+                }
+                fields += 1;
+                write_varint(&mut body, fid as u64);
+                write_docset(&mut body, &docs);
+                write_varint(&mut body, start);
+            }
+            if fields == 0 {
                 continue;
             }
             fst.insert(term, post.len)?;
             rec.clear();
-            write_varint(&mut rec, fields.len() as u64);
-            for (fid, (docs, pos)) in &fields {
-                write_varint(&mut rec, *fid as u64);
-                write_docset(&mut rec, docs);
-                write_varint(&mut rec, positions.len);
-                positions.put(pos)?;
-            }
+            write_varint(&mut rec, fields);
+            rec.extend_from_slice(&body);
             post.put(&rec)?;
+            relief(docs_end + post.len + positions.len);
         }
         fst.finish()?;
     }
@@ -1203,30 +1498,17 @@ pub fn merge(inputs: &[MergeInput], schema: &Schema, path: &Path, level: i32) ->
     secs[S_PKS] = sink.end();
 
     // Sort columns.
-    let mut cols: BTreeMap<u16, SortBuild> = BTreeMap::new();
+    sink.begin();
+    let mut sort_meta = Vec::new();
     let fids: BTreeSet<u16> = inputs.iter().flat_map(|inp| inp.seg.sortcols.keys().copied()).collect();
     for fid in fids {
-        let col = cols.entry(fid).or_default();
-        for (i, inp) in inputs.iter().enumerate() {
-            if !inp.seg.sortcols.contains_key(&fid) {
-                continue;
-            }
-            for d in 0..inp.seg.doc_count {
-                let new = remap[i][d as usize];
-                if new == u32::MAX {
-                    continue;
-                }
-                match inp.seg.sort_key(fid, d) {
-                    SortKey::Num(f) => col.nums.push((new, f)),
-                    SortKey::Str(s) => col.strs.push((new, String::from_utf8(s).map_err(|_| Error::corrupt("bad sort value"))?)),
-                    SortKey::Missing => {}
-                }
-            }
-        }
+        sort_meta.push((fid, merge_sort_column(inputs, &remap, fid, &mut sink, path)?));
     }
-    let (sort, sort_meta) = encode_sort(n as usize, cols);
-    secs[S_SORT] = sink.put(&sort)?;
-    let meta = MetaFile { doc_count: n, field_counts: counts.into_iter().collect(), sort: sort_meta };
+    secs[S_SORT] = sink.end();
+    // Known only when every input knows it; a document that was deleted may
+    // have been the only one with several numbers, which errs on the safe side.
+    let multi_num = inputs.iter().map(|inp| inp.seg.multi_num.as_ref()).collect::<Option<Vec<_>>>().map(|sets| sets.into_iter().flatten().copied().collect::<BTreeSet<u16>>().into_iter().collect());
+    let meta = MetaFile { doc_count: n, field_counts: counts.into_iter().collect(), sort: sort_meta, multi_num };
     secs[S_META] = sink.put(&serde_json::to_vec(&meta)?)?;
     secs[S_POS] = positions.move_into(&mut sink)?;
 
@@ -1258,6 +1540,26 @@ impl AsRef<[u8]> for Section {
     fn as_ref(&self) -> &[u8] {
         &self.mmap[self.off..self.off + self.len]
     }
+}
+
+/// CRC32 of a stretch of a mapped file. Reading it maps its pages into the
+/// process; they are let go piece by piece, so that checking a file of any
+/// size takes a few megabytes and a server at rest holds only what its
+/// searches touch. The pages stay in the system's cache.
+fn checksum(mmap: &Mmap, off: usize, len: usize) -> u32 {
+    const PIECE: usize = 4 << 20;
+    let mut crc = crc32fast::Hasher::new();
+    let mut at = off;
+    while at < off + len {
+        let n = PIECE.min(off + len - at);
+        crc.update(&mmap[at..at + n]);
+        #[cfg(unix)]
+        unsafe {
+            let _ = mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, at, n);
+        }
+        at += n;
+    }
+    crc.finalize()
 }
 
 /// Removes the segment file once the last reader has released it.
@@ -1300,6 +1602,7 @@ pub struct Segment {
     pks: Map<Section>,
     sort: Section,
     sortcols: HashMap<u16, SortColMeta>,
+    multi_num: Option<Vec<u16>>,
     cache: BlockCache,
     deleter: Deleter,
 }
@@ -1310,7 +1613,7 @@ impl Segment {
         let mmap = Arc::new(unsafe { Mmap::map(&file)? });
         let size = mmap.len();
         let bad = |m: &str| Error::corrupt(format!("{}: {m}", path.display()));
-        if size < MAGIC.len() + FOOTER_LEN || &mmap[..8] != MAGIC || &mmap[size - 8..] != MAGIC {
+        if size < MAGIC.len() + FOOTER_LEN || (&mmap[..8] != MAGIC && &mmap[..8] != MAGIC_V1) || mmap[size - 8..] != mmap[..8] {
             return Err(bad("not a complete segment file"));
         }
         let footer = &mmap[size - FOOTER_LEN..size - 12];
@@ -1328,14 +1631,12 @@ impl Segment {
                 return Err(bad("section out of bounds"));
             }
             // Document blocks carry their own checksum and are verified on read.
-            if i != S_DOCS && crc32fast::hash(&mmap[off..off + len]) != crc {
+            if i != S_DOCS && checksum(&mmap, off, len) != crc {
                 return Err(bad("section checksum mismatch"));
             }
             secs.push(Section { mmap: mmap.clone(), off, len });
         }
-        // The checksums have just read every page of the index. Let go of
-        // them, so that a server at rest holds only what its searches touch;
-        // the pages stay in the system's cache and come back on first use.
+        // The pieces do not end on page boundaries: let go of what is left.
         #[cfg(unix)]
         unsafe {
             let _ = mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed);
@@ -1356,9 +1657,31 @@ impl Segment {
             pks: Map::new(secs[S_PKS].clone())?,
             sort: secs[S_SORT].clone(),
             sortcols: meta.sort.into_iter().collect(),
+            multi_num: meta.multi_num,
             cache: Mutex::new(None),
             deleter: Deleter { path: path.to_path_buf(), armed: AtomicBool::new(false) },
         })
+    }
+
+    /// Whether no document of this segment holds more than one number in
+    /// the field. Then two bounds on the field are one range, and a document
+    /// that passes a range filter is sorted by the number that passed it.
+    pub fn one_number_each(&self, fid: u16) -> bool {
+        self.multi_num.as_ref().is_some_and(|multi| !multi.contains(&fid))
+    }
+
+    /// Bytes of the sort columns.
+    pub fn sort_bytes(&self) -> u64 {
+        self.sort.len as u64
+    }
+
+    /// Let go of the pages of this file that the process has mapped. They
+    /// stay in the system's cache and come back when they are read again.
+    pub fn release_pages(&self) {
+        #[cfg(unix)]
+        unsafe {
+            let _ = self.docs.mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed);
+        }
     }
 
     /// Delete the file when the last reader drops this segment.
@@ -1590,15 +1913,17 @@ impl Segment {
 
     /// Documents with a numeric value of the field inside the range.
     pub fn num_range(&self, fid: u16, lo: [u8; 8], lo_incl: bool, hi: [u8; 8], hi_incl: bool) -> Result<RoaringBitmap> {
-        let mut acc = RoaringBitmap::new();
-        self.range_level(fid, TAG_NUM_L2, lo, lo_incl, hi, hi_incl, &mut acc)?;
-        Ok(acc)
+        // The sets are joined in one go: adding them one by one to a set
+        // that grows costs several times as much.
+        let mut parts = Vec::new();
+        self.range_level(fid, TAG_NUM_L2, lo, lo_incl, hi, hi_incl, &mut parts)?;
+        Ok(roaring::MultiOps::union(parts))
     }
 
     /// Take every run of this level that lies wholly inside the range, then
     /// cover what is left at both ends with the level below.
     #[allow(clippy::too_many_arguments)]
-    fn range_level(&self, fid: u16, tag: u8, lo: [u8; 8], lo_incl: bool, hi: [u8; 8], hi_incl: bool, acc: &mut RoaringBitmap) -> Result<()> {
+    fn range_level(&self, fid: u16, tag: u8, lo: [u8; 8], lo_incl: bool, hi: [u8; 8], hi_incl: bool, acc: &mut Vec<RoaringBitmap>) -> Result<()> {
         if lo > hi || (lo == hi && !(lo_incl && hi_incl)) {
             return Ok(());
         }
@@ -1609,7 +1934,7 @@ impl Segment {
                 if (!lo_incl && key == lo_key.as_slice()) || (!hi_incl && key == hi_key.as_slice()) {
                     continue;
                 }
-                *acc |= self.facet_record(off)?.1;
+                acc.push(self.facet_record(off)?.1);
             }
             return Ok(());
         }
@@ -1630,7 +1955,7 @@ impl Segment {
                 if run_hi > hi || (run_hi == hi && !hi_incl) {
                     break;
                 }
-                *acc |= self.facet_record(off)?.1;
+                acc.push(self.facet_record(off)?.1);
                 full = Some((full.map_or(run_lo, |f| f.0), run_hi));
             }
         }
@@ -1654,29 +1979,86 @@ impl Segment {
         Ok(())
     }
 
-    /// A document's place in the order of one sort column, comparable only
-    /// inside this segment: numbers first, then strings by their rank among
-    /// the segment's strings, then documents without a value. Unlike
-    /// `sort_key` it copies no string.
-    pub fn sort_rank(&self, fid: u16, docid: u32) -> (u8, f64) {
-        let Some(col) = self.sortcols.get(&fid) else { return (2, 0.0) };
+    /// The place of each of `docs` in the order of one sort column,
+    /// comparable only inside this segment. Unlike `sort_key` it copies no
+    /// string.
+    pub fn sort_ranks(&self, fid: u16, docs: &RoaringBitmap) -> Vec<(Rank, u32)> {
         let buf = self.sort.as_ref();
-        let d = docid as usize;
-        if let Some((off, _)) = col.num {
-            let p = off as usize + d * 8;
-            let f = f64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
-            if !f.is_nan() {
-                return (0, f);
+        match self.sortcols.get(&fid) {
+            Some(col) => docs.iter().map(|d| (col_rank(buf, col, d as usize), d)).collect(),
+            None => docs.iter().map(|d| ((2, 0.0), d)).collect(),
+        }
+    }
+
+    fn order(&self, fid: u16) -> Order<'_> {
+        let buf = self.sort.as_ref();
+        match self.sortcols.get(&fid) {
+            Some(SortColMeta { order: Some((off, len)), .. }) => Order::Stored(&buf[*off as usize..(*off + *len) as usize]),
+            Some(col) => Order::Built(sorted_docs(buf, col, self.doc_count as usize)),
+            None => Order::Built(Vec::new()),
+        }
+    }
+
+    /// The documents of `docs` that come first in the order of a sort
+    /// column, descending when `asc` is false: the first `want` of them and
+    /// every one tied with the last. The stored order is walked from its
+    /// end, so the cost is the number of entries read, not the number of
+    /// candidates. `from` is a number that no document of `docs` comes
+    /// before: the walk starts there instead of at the end.
+    ///
+    /// `None` when the segment has no stored order for the column, or when
+    /// more than `budget` entries would have to be read: the caller then
+    /// ranks the candidates one by one.
+    pub fn sort_head(&self, fid: u16, docs: &RoaringBitmap, want: usize, asc: bool, from: Option<f64>, budget: usize) -> Option<RoaringBitmap> {
+        let col = self.sortcols.get(&fid)?;
+        let (off, len) = col.order?;
+        let buf = self.sort.as_ref();
+        let order = &buf[off as usize..(off + len) as usize];
+        let n = order.len() / 4;
+        let doc_at = |i: usize| u32::from_le_bytes(order[i * 4..i * 4 + 4].try_into().unwrap());
+        // How many entries, from the end the walk starts at, come before `from`.
+        let skipped = match from {
+            None => 0,
+            Some(v) => {
+                let before = |i: usize| {
+                    let ord = cmp_rank(&col_rank(buf, col, doc_at(i) as usize), &(0, v));
+                    if asc { ord == std::cmp::Ordering::Less } else { ord == std::cmp::Ordering::Greater }
+                };
+                let (mut lo, mut hi) = (0, n);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if before(if asc { mid } else { n - 1 - mid }) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            }
+        };
+        let mut picked: Vec<u32> = Vec::with_capacity(want.min(1024) + 8);
+        let mut last: Rank = (2, 0.0);
+        for step in skipped..n {
+            if step - skipped >= budget {
+                return None;
+            }
+            let d = doc_at(if asc { step } else { n - 1 - step });
+            if picked.len() < want {
+                if docs.contains(d) {
+                    picked.push(d);
+                    last = col_rank(buf, col, d as usize);
+                }
+            } else if cmp_rank(&col_rank(buf, col, d as usize), &last) != std::cmp::Ordering::Equal {
+                return Some(picked.into_iter().collect());
+            } else if docs.contains(d) {
+                picked.push(d);
             }
         }
-        if let Some((off, _)) = col.ord {
-            let p = off as usize + d * 4;
-            let ord = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
-            if ord != u32::MAX {
-                return (1, ord as f64);
-            }
+        if picked.len() < want {
+            // Every candidate with a value is in: the rest have none, and tie.
+            return Some(docs.clone());
         }
-        (2, 0.0)
+        Some(picked.into_iter().collect())
     }
 
     pub fn sort_key(&self, fid: u16, docid: u32) -> SortKey {

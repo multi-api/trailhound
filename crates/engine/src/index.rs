@@ -51,10 +51,17 @@ fn index_threads() -> usize {
         n => n,
     }
 }
-/// Merging stops growing a segment past this many documents.
+/// Merging stops growing a segment past this many documents. On 6.4 million
+/// Wikipedia articles, segments of up to 4 and of up to 64 million made the
+/// light searches faster (a word, a title, a sort: 20 to 60% at the median)
+/// and the heavy ones slower (several common words: 10 to 15% under load,
+/// and up to twice as long for a search running alone, which spreads its
+/// segments over threads), with 1.5 to 2.2 GB more disk in use while merging.
 const MAX_MERGED_DOCS: u64 = 1_000_000;
 const MERGE_TRIGGER: usize = 8;
-const MERGE_WIDTH: usize = 5;
+/// The most segments joined in one merge.
+const MERGE_WIDTH: usize = 16;
+const MERGE_RATIO: u64 = 2;
 /// zstd level of the document blocks. They are 16 KB each, too small for the
 /// highest levels to pay: on Wikipedia text, level 19 took eleven times as
 /// long as this one to make the documents 2% smaller, and compressing them
@@ -655,20 +662,9 @@ impl Index {
     fn maybe_merge(&self, task: u64) -> Result<()> {
         loop {
             let st = self.snapshot();
-            if st.segs.len() <= MERGE_TRIGGER {
-                return Ok(());
-            }
-            let mut picked: Vec<usize> = (0..st.segs.len()).collect();
-            picked.sort_by_key(|i| st.segs[*i].live_count());
-            picked.truncate(MERGE_WIDTH);
-            let live = |p: &[usize]| p.iter().map(|i| st.segs[*i].live_count()).sum::<u64>();
-            while picked.len() > 2 && live(&picked) > MAX_MERGED_DOCS {
-                picked.pop();
-            }
-            let total = live(&picked);
-            if total > MAX_MERGED_DOCS {
-                return Ok(());
-            }
+            let sizes: Vec<(u64, u64)> = st.segs.iter().map(|s| (s.live_count(), s.seg.sort_bytes())).collect();
+            let Some(mut picked) = pick_merge(&sizes) else { return Ok(()) };
+            let total: u64 = picked.iter().map(|i| sizes[*i].0).sum();
             picked.sort_unstable();
             let mut manifest = st.manifest.clone();
             let mut segs: Vec<SegHandle> = st.segs.iter().enumerate().filter(|(i, _)| !picked.contains(i)).map(|(_, s)| s.share()).collect();
@@ -760,16 +756,53 @@ impl Index {
     }
 }
 
+/// Which segments to merge next, given the live documents and the bytes of
+/// sort columns of each; `None` when there is nothing to do.
+///
+/// Above `MERGE_TRIGGER` segments the smallest are merged, as many as are of
+/// a size: a segment joins only while it is at most `MERGE_RATIO` times what
+/// has been gathered below it. A write that leaves a dozen small segments
+/// has them joined in one pass instead of three, and a large segment is not
+/// written again to take in a few documents.
+fn pick_merge(sizes: &[(u64, u64)]) -> Option<Vec<usize>> {
+    if sizes.len() <= MERGE_TRIGGER {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by_key(|i| sizes[*i].0);
+    let mut picked = vec![order[0]];
+    let (mut docs, mut sort) = sizes[order[0]];
+    for &i in &order[1..] {
+        let (d, s) = sizes[i];
+        // The strings of a sort column are addressed with 32 bits.
+        if picked.len() >= MERGE_WIDTH || docs + d > MAX_MERGED_DOCS || sort + s > u32::MAX as u64 {
+            break;
+        }
+        if picked.len() >= 2 && d > MERGE_RATIO * docs {
+            break;
+        }
+        picked.push(i);
+        docs += d;
+        sort += s;
+    }
+    (picked.len() >= 2).then_some(picked)
+}
+
 /// Live documents of every segment, restricted by an optional filter.
 pub fn universe(st: &State, filter: Option<&Value>) -> Result<Vec<RoaringBitmap>> {
     let parsed = match filter {
         Some(v) => filter::parse_value(v)?,
         None => None,
     };
+    universe_of(st, parsed.as_ref())
+}
+
+/// Like `universe`, for a filter that has been parsed already.
+pub fn universe_of(st: &State, filter: Option<&filter::Filter>) -> Result<Vec<RoaringBitmap>> {
     let mut out = Vec::with_capacity(st.segs.len());
     for s in &st.segs {
         let mut live = s.live();
-        if let Some(f) = &parsed {
+        if let Some(f) = filter {
             live &= filter::eval(f, &s.seg, &st.schema, &st.manifest.settings.filterable_attributes)?;
         }
         out.push(live);
@@ -782,5 +815,37 @@ fn merge_into(target: &mut Value, patch: Value) {
         for (k, v) in p {
             t.insert(k, v);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pick(docs: &[u64]) -> Option<Vec<usize>> {
+        let sizes: Vec<(u64, u64)> = docs.iter().map(|d| (*d, 0)).collect();
+        pick_merge(&sizes).map(|mut p| {
+            p.sort_unstable();
+            p
+        })
+    }
+
+    #[test]
+    fn merges_take_the_small_segments_and_leave_the_large() {
+        // Nothing to do up to the trigger.
+        assert_eq!(pick(&[5; 8]), None);
+        // The small ones of a write go in one merge, without the large ones.
+        assert_eq!(pick(&[900_000, 6_000, 6_000, 400_000, 6_000, 6_000, 6_000, 6_000, 6_000, 6_000]), Some(vec![1, 2, 4, 5, 6, 7, 8, 9]));
+        // A larger segment joins once those below it add up to half of it.
+        assert_eq!(pick(&[300, 100, 100, 100, 50_000, 50_000, 50_000, 50_000, 50_000]), Some(vec![0, 1, 2, 3]));
+        assert_eq!(pick(&[700, 100, 100, 100, 50_000, 50_000, 50_000, 50_000, 50_000]), Some(vec![1, 2, 3]));
+        // Never more than the width, never past the cap.
+        assert_eq!(pick(&[10; 40]).map(|p| p.len()), Some(MERGE_WIDTH));
+        assert_eq!(pick(&[400_000; 9]).map(|p| p.len()), Some(2));
+        assert_eq!(pick(&[600_000; 9]), None);
+        // The two smallest are merged whatever their sizes, to get back under the trigger.
+        assert_eq!(pick(&[1, 100, 900, 900, 900, 900, 900, 900, 900]), Some(vec![0, 1]));
+        // Sort columns that would not fit in one segment stay apart.
+        assert_eq!(pick_merge(&[(10, 3 << 30); 9]), None);
     }
 }
