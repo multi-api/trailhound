@@ -407,14 +407,13 @@ pub fn eval(f: &Filter, seg: &Segment, schema: &Schema, filterable: &[String]) -
                 let mut one = None;
                 if let Filter::Range(field, ..) = p {
                     let others = parts.iter().enumerate().skip(i + 1).filter(|(_, o)| matches!(o, Filter::Range(f, ..) if f == field)).count();
-                    if others > 0 && field_ids(schema, filterable, field)?.iter().all(|fid| seg.one_number_each(*fid)) {
-                        if let Some((lo, hi)) = narrowed(&parts, field) {
+                    if others > 0 && field_ids(schema, filterable, field)?.iter().all(|fid| seg.one_number_each(*fid))
+                        && let Some((lo, hi)) = narrowed(&parts, field) {
                             for (j, o) in parts.iter().enumerate().skip(i + 1) {
                                 merged[j] |= matches!(o, Filter::Range(f, ..) if f == field);
                             }
                             one = Some(Filter::Range(field.clone(), lo, hi));
                         }
-                    }
                 }
                 let bm = eval(one.as_ref().unwrap_or(p), seg, schema, filterable)?;
                 acc = Some(match acc {

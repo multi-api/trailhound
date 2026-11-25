@@ -1,7 +1,7 @@
 [package]
 name = "trailhound-engine"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 authors = ["Multi API SpA"]
 description = "Low-memory, multi-tenant search engine core used by Trailhound."

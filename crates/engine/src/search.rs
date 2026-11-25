@@ -234,11 +234,10 @@ fn word_hits(seg: &Segment, word: &QWord, lev: Option<&Typos>, settings: &Settin
     if let Some(syns) = settings.synonyms.get(&word.text) {
         for syn in syns {
             let toks = tokenize(syn);
-            if toks.len() == 1 {
-                if let Some(off) = seg.terms().get(toks[0].text.as_bytes()) {
+            if toks.len() == 1
+                && let Some(off) = seg.terms().get(toks[0].text.as_bytes()) {
                     note(off, 0);
                 }
-            }
         }
     }
     let mut hits = WordHits { exact_term, ..WordHits::default() };
@@ -902,12 +901,11 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
                     // document is sorted by the number that passed it.
                     let from = ctx.bounds.get(&fid).and_then(|(lo, hi)| if *asc { *lo } else { *hi }).filter(|_| seg.one_number_each(fid));
                     let expected = (want as u64).saturating_mul(seg.doc_count as u64) / have as u64;
-                    if from.is_some() || expected.saturating_mul(WALK_MARGIN) <= have as u64 {
-                        if let Some(head) = seg.sort_head(fid, bm, want, *asc, from, have / WALK_COST) {
+                    if (from.is_some() || expected.saturating_mul(WALK_MARGIN) <= have as u64)
+                        && let Some(head) = seg.sort_head(fid, bm, want, *asc, from, have / WALK_COST) {
                             *bm = head;
                             continue;
                         }
-                    }
                     let mut ranked = seg.sort_ranks(fid, bm);
                     ranked.select_nth_unstable_by(want - 1, |a, b| by_rank(&a.0, &b.0));
                     let last = ranked[want - 1].0;

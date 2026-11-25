@@ -564,8 +564,8 @@ impl Index {
         let fresh = writer.out.iter_mut().rev().map(|s| (s.seg.clone(), &mut s.deleted));
         let stored = st.segs.iter().zip(deleted.iter_mut()).map(|(s, d)| (s.seg.clone(), d));
         for (seg, del) in fresh.chain(stored) {
-            if let Some(d) = seg.pk_lookup(id) {
-                if !del.contains(d) {
+            if let Some(d) = seg.pk_lookup(id)
+                && !del.contains(d) {
                     if partial {
                         let mut old = seg.doc(d)?;
                         merge_into(&mut old, std::mem::take(doc));
@@ -574,7 +574,6 @@ impl Index {
                     del.insert(d);
                     return Ok(());
                 }
-            }
         }
         Ok(())
     }
@@ -591,11 +590,10 @@ impl Index {
         let mut n = 0;
         for id in ids {
             for (i, s) in st.segs.iter().enumerate() {
-                if let Some(d) = s.seg.pk_lookup(id) {
-                    if deleted[i].insert(d) {
+                if let Some(d) = s.seg.pk_lookup(id)
+                    && deleted[i].insert(d) {
                         n += 1;
                     }
-                }
             }
         }
         self.apply_deletions(&st, deleted, task)?;
@@ -682,11 +680,10 @@ impl Index {
     pub fn get_document(&self, id: &str) -> Result<Option<Value>> {
         let st = self.snapshot();
         for s in &st.segs {
-            if let Some(d) = s.seg.pk_lookup(id) {
-                if !s.deleted.contains(d) {
+            if let Some(d) = s.seg.pk_lookup(id)
+                && !s.deleted.contains(d) {
                     return Ok(Some(s.seg.doc(d)?));
                 }
-            }
         }
         Ok(None)
     }
@@ -729,11 +726,10 @@ impl Index {
     /// are not counted, although they stay in their segment until a merge.
     pub fn field_distribution(&self) -> Result<BTreeMap<String, u64>> {
         let st = self.snapshot();
-        if let Some((of, dist)) = self.distribution.lock().unwrap().as_ref() {
-            if of.upgrade().is_some_and(|s| Arc::ptr_eq(&s, &st)) {
+        if let Some((of, dist)) = self.distribution.lock().unwrap().as_ref()
+            && of.upgrade().is_some_and(|s| Arc::ptr_eq(&s, &st)) {
                 return Ok(dist.clone());
             }
-        }
         let mut counts: BTreeMap<u16, u64> = BTreeMap::new();
         for s in &st.segs {
             for (fid, n) in &s.seg.field_counts {
