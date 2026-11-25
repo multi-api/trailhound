@@ -38,7 +38,7 @@ pub fn tune_allocator() {
     unsafe {
         let knob = |name: &str, default: i32| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
         libc::mallopt(libc::M_MMAP_THRESHOLD, knob("TRAILHOUND_MALLOC_MMAP_KB", 256) * 1024);
-        libc::mallopt(libc::M_TRIM_THRESHOLD, knob("TRAILHOUND_MALLOC_TRIM_KB", 1024) * 1024);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, knob("TRAILHOUND_MALLOC_TRIM_KB", 256) * 1024);
         // One arena per core keeps concurrent searches from queueing on a lock.
         let cores = std::thread::available_parallelism().map_or(8, |n| n.get() as i32);
         libc::mallopt(libc::M_ARENA_MAX, knob("TRAILHOUND_MALLOC_ARENAS", cores.max(8)));

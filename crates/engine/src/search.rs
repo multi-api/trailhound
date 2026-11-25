@@ -12,6 +12,7 @@ use fst::{IntoStreamer, Streamer};
 use roaring::RoaringBitmap;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -142,10 +143,11 @@ fn phrase_docs(seg: &Segment, phrase: &[String], cands: &RoaringBitmap, allowed:
         }
         // Per word, its (document, position) pairs in document order; the
         // lists are then walked side by side.
+        let want: Vec<u32> = docs.iter().collect();
         let mut positions: Vec<Vec<(u32, u32)>> = Vec::with_capacity(in_field.len());
         for (_, bm, pos_off) in &in_field {
             let mut list = Vec::new();
-            seg.for_each_position(*pos_off, bm, &docs, |d, p| list.push((d, p)))?;
+            seg.scan_positions(*pos_off, bm, &want, |w, p| list.push((want[w], p)))?;
             positions.push(list);
         }
         let mut at = vec![0usize; positions.len()];
@@ -207,7 +209,17 @@ fn collect<A: Automaton>(seg: &Segment, aut: A, limit: usize, mut f: impl FnMut(
     }
 }
 
-fn word_hits(seg: &Segment, word: &QWord, lev: Option<&Typos>, settings: &Settings, allowed: Option<&HashSet<u16>>, limit: usize) -> Result<WordHits> {
+/// Below this many terms the postings of a word are read in one go.
+const TERMS_PER_PIECE: usize = 64;
+
+/// The dictionary terms a query word follows in one segment: the posting
+/// offset of each one with its number of typos, in file order.
+struct Derived {
+    exact_term: Option<u64>,
+    terms: Vec<(u64, usize)>,
+}
+
+fn derive(seg: &Segment, word: &QWord, lev: Option<&Typos>, settings: &Settings, limit: usize) -> Derived {
     let mut derivs: HashMap<u64, usize> = HashMap::new();
     let mut note = |off: u64, typos: usize| {
         let e = derivs.entry(off).or_insert(typos);
@@ -241,29 +253,63 @@ fn word_hits(seg: &Segment, word: &QWord, lev: Option<&Typos>, settings: &Settin
             }
         }
     }
-    let mut hits = WordHits { exact_term, ..WordHits::default() };
-    for (off, typos) in derivs {
-        hits.terms.push(off);
-        for (fid, bm, _) in seg.postings(off)? {
-            if allowed.is_some_and(|a| !a.contains(&fid)) {
-                continue;
+    let mut terms: Vec<(u64, usize)> = derivs.into_iter().collect();
+    terms.sort_unstable();
+    Derived { exact_term, terms }
+}
+
+impl WordHits {
+    /// The documents of some of a word's terms. The typo levels still
+    /// overlap: `finish` settles them once every term has been read.
+    fn read(seg: &Segment, exact_term: Option<u64>, terms: &[(u64, usize)], allowed: Option<&HashSet<u16>>) -> Result<WordHits> {
+        let mut hits = WordHits::default();
+        for &(off, typos) in terms {
+            hits.terms.push(off);
+            for (fid, bm, _) in seg.postings(off)? {
+                if allowed.is_some_and(|a| !a.contains(&fid)) {
+                    continue;
+                }
+                if exact_term == Some(off) {
+                    hits.exact |= &bm;
+                }
+                hits.lvl[typos] |= &bm;
+                if typos == 0 {
+                    *hits.per_field_exact.entry(fid).or_default() |= &bm;
+                }
+                *hits.per_field.entry(fid).or_default() |= bm;
             }
-            if exact_term == Some(off) {
-                hits.exact |= &bm;
-            }
-            hits.lvl[typos] |= &bm;
-            if typos == 0 {
-                *hits.per_field_exact.entry(fid).or_default() |= &bm;
-            }
-            *hits.per_field.entry(fid).or_default() |= bm;
+        }
+        Ok(hits)
+    }
+
+    fn absorb(&mut self, other: WordHits) {
+        if self.terms.is_empty() {
+            let exact_term = self.exact_term;
+            *self = other;
+            self.exact_term = exact_term;
+            return;
+        }
+        for (mine, theirs) in self.lvl.iter_mut().zip(&other.lvl) {
+            *mine |= theirs;
+        }
+        self.exact |= other.exact;
+        self.terms.extend(other.terms);
+        for (fid, bm) in other.per_field {
+            *self.per_field.entry(fid).or_default() |= bm;
+        }
+        for (fid, bm) in other.per_field_exact {
+            *self.per_field_exact.entry(fid).or_default() |= bm;
         }
     }
-    let l0 = hits.lvl[0].clone();
-    hits.lvl[1] -= &l0;
-    let l01 = &l0 | &hits.lvl[1];
-    hits.lvl[2] -= &l01;
-    hits.any = l01 | &hits.lvl[2];
-    Ok(hits)
+
+    /// A document counts for the fewest typos it matches with.
+    fn finish(&mut self) {
+        let l0 = self.lvl[0].clone();
+        self.lvl[1] -= &l0;
+        let l01 = &l0 | &self.lvl[1];
+        self.lvl[2] -= &l01;
+        self.any = l01 | &self.lvl[2];
+    }
 }
 
 /// Typo tolerance as an automaton over the term dictionary, computed on the
@@ -430,16 +476,85 @@ fn prof(i: usize, t: std::time::Instant) { PROF[i].fetch_add(t.elapsed().as_micr
 /// starting threads would cost more than the work itself.
 const PARALLEL_MIN_DOCS: u64 = 1_500;
 
-/// Run `f` for every segment, on one thread per segment when asked to.
-fn per_segment<T: Send>(n: usize, parallel: bool, f: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
-    if !parallel || n < 2 || !alone() {
+/// Threads a search running alone spreads its heavy stages over.
+const SPREAD: usize = 8;
+
+fn spread() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(SPREAD))
+}
+
+/// The candidates cut into pieces of work: one per segment, or, when the
+/// work is worth spreading, runs of documents of about the same size, so
+/// that a search uses as many threads on an index kept in one segment as on
+/// one kept in eight.
+fn pieces(cands: &Cands, parallel: bool) -> Vec<(usize, Cow<'_, RoaringBitmap>)> {
+    cut(cands, if parallel && alone() { spread() as u64 } else { 1 })
+}
+
+fn cut(cands: &Cands, threads: u64) -> Vec<(usize, Cow<'_, RoaringBitmap>)> {
+    let per = count(cands).div_ceil(threads).max(PARALLEL_MIN_DOCS / 2);
+    let mut out = Vec::new();
+    for (s, bm) in cands.iter().enumerate() {
+        let len = bm.len();
+        if len == 0 {
+            continue;
+        }
+        let n = if threads == 1 { 1 } else { ((len + per / 2) / per).max(1) };
+        if n == 1 {
+            out.push((s, Cow::Borrowed(bm)));
+            continue;
+        }
+        let (mut from, last) = (0u32, bm.max().unwrap_or(0));
+        for i in 1..=n {
+            // Up to the first document of the next piece, or to the end.
+            let mut piece = RoaringBitmap::new();
+            match bm.select((i * len / n) as u32).filter(|_| i < n) {
+                Some(to) => {
+                    piece.insert_range(from..to);
+                    from = to;
+                }
+                None => {
+                    piece.insert_range(from..=last);
+                }
+            }
+            piece &= bm;
+            out.push((s, Cow::Owned(piece)));
+        }
+    }
+    out
+}
+
+/// Run `f` for every piece of work, each on its own thread when asked to.
+fn per_piece<T: Send>(n: usize, parallel: bool, f: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
+    if !parallel || n < 2 || spread() < 2 || !alone() {
         return (0..n).map(f).collect();
     }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut slots: Vec<Option<Result<T>>> = (0..n).map(|_| None).collect();
     std::thread::scope(|scope| {
-        let f = &f;
-        let handles: Vec<_> = (0..n).map(|s| scope.spawn(move || f(s))).collect();
-        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(Error::corrupt("a search thread panicked")))).collect()
-    })
+        let (f, next) = (&f, &next);
+        let work = move || {
+            let mut done = Vec::new();
+            loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n {
+                    return done;
+                }
+                done.push((i, f(i)));
+            }
+        };
+        // The calling thread takes its share of the pieces.
+        let helpers: Vec<_> = (1..n.min(spread())).map(|_| scope.spawn(work)).collect();
+        let mut done = work();
+        for h in helpers {
+            done.extend(h.join().unwrap_or_default());
+        }
+        for (i, r) in done {
+            slots[i] = Some(r);
+        }
+    });
+    slots.into_iter().map(|r| r.unwrap_or_else(|| Err(Error::corrupt("a search thread panicked")))).collect()
 }
 
 fn count(c: &Cands) -> u64 {
@@ -647,20 +762,19 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
                 return rank(ctx, rest, cands, k, out, need);
             }
             let t_prof = std::time::Instant::now();
-            let grouped = per_segment(nseg, total >= PARALLEL_MIN_DOCS, |s| -> Result<BTreeMap<u32, RoaringBitmap>> {
+            let parts = pieces(&cands, total >= PARALLEL_MIN_DOCS);
+            let grouped = per_piece(parts.len(), total >= PARALLEL_MIN_DOCS, |t| -> Result<BTreeMap<u32, RoaringBitmap>> {
                 let mut groups: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
-                if cands[s].is_empty() {
-                    return Ok(groups);
-                }
+                let (s, piece) = (parts[t].0, &*parts[t].1);
                 let seg = &ctx.st.segs[s].seg;
-                let want: Vec<u32> = cands[s].iter().collect();
+                let want: Vec<u32> = piece.iter().collect();
                 // Per word: every (document, field, position) where it matches.
                 let mut occ: Vec<Vec<(u32, u16, u32)>> = Vec::with_capacity(k);
                 for w in &ctx.words[..k] {
                     let mut found = Vec::new();
                     for off in &w[s].terms {
                         for (fid, docs, pos_off) in seg.postings(*off)? {
-                            if ctx.allowed.as_ref().is_some_and(|a| !a.contains(&fid)) || docs.is_disjoint(&cands[s]) {
+                            if ctx.allowed.as_ref().is_some_and(|a| !a.contains(&fid)) || docs.is_disjoint(piece) {
                                 continue;
                             }
                             seg.scan_positions(pos_off, &docs, &want, |w, p| found.push((want[w], fid, p)))?;
@@ -692,11 +806,12 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
             })?;
             prof(0, t_prof);
             let mut buckets: BTreeMap<u32, Cands> = BTreeMap::new();
-            for (s, groups) in grouped.into_iter().enumerate() {
+            for ((s, _), groups) in parts.iter().zip(grouped) {
                 for (prox, docs) in groups {
-                    buckets.entry(prox).or_insert_with(|| vec![RoaringBitmap::new(); nseg])[s] = docs;
+                    buckets.entry(prox).or_insert_with(|| vec![RoaringBitmap::new(); nseg])[*s] |= docs;
                 }
             }
+            drop(parts);
             for (_, bucket) in buckets {
                 rank(ctx, rest, bucket, k, out, need)?;
                 if out.len() >= need {
@@ -763,20 +878,19 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
             // Cost of a document: for every query word, how far its best
             // occurrence is from where the word sits in the query, added up.
             let t_prof = std::time::Instant::now();
-            let grouped = per_segment(nseg, total >= PARALLEL_MIN_DOCS, |s| -> Result<BTreeMap<u32, RoaringBitmap>> {
+            let parts = pieces(&cands, total >= PARALLEL_MIN_DOCS);
+            let grouped = per_piece(parts.len(), total >= PARALLEL_MIN_DOCS, |t| -> Result<BTreeMap<u32, RoaringBitmap>> {
                 let mut groups: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
-                let want: Vec<u32> = cands[s].iter().collect();
+                let (s, piece) = (parts[t].0, &*parts[t].1);
+                let want: Vec<u32> = piece.iter().collect();
                 let size = want.len();
-                if size == 0 {
-                    return Ok(groups);
-                }
                 let seg = &ctx.st.segs[s].seg;
                 let mut sum = vec![0u8; size];
                 for (i, w) in ctx.words[..k].iter().enumerate() {
                     let mut best = vec![POSITION_MAX_COST; size];
                     for off in &w[s].terms {
                         for (fid, docs, pos_off) in seg.postings(*off)? {
-                            if ctx.allowed.as_ref().is_some_and(|a| !a.contains(&fid)) || docs.is_disjoint(&cands[s]) {
+                            if ctx.allowed.as_ref().is_some_and(|a| !a.contains(&fid)) || docs.is_disjoint(piece) {
                                 continue;
                             }
                             seg.scan_positions(pos_off, &docs, &want, |idx, p| {
@@ -798,11 +912,12 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
             })?;
             prof(1, t_prof);
             let mut buckets: BTreeMap<u32, Cands> = BTreeMap::new();
-            for (s, groups) in grouped.into_iter().enumerate() {
+            for ((s, _), groups) in parts.iter().zip(grouped) {
                 for (cost, docs) in groups {
-                    buckets.entry(cost).or_insert_with(|| vec![RoaringBitmap::new(); nseg])[s] = docs;
+                    buckets.entry(cost).or_insert_with(|| vec![RoaringBitmap::new(); nseg])[*s] |= docs;
                 }
             }
+            drop(parts);
             for (cost, bucket) in buckets {
                 ctx.position_cost.store(cost, std::sync::atomic::Ordering::Relaxed);
                 let done = rank(ctx, rest, bucket, k, out, need);
@@ -823,12 +938,13 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
             let t_prof = std::time::Instant::now();
             let placed = matches!(ctx.position_cost.load(std::sync::atomic::Ordering::Relaxed), 0 | u32::MAX);
             let whole_query = placed && k == ctx.words.len() && total <= PROXIMITY_MAX_DOCS;
-            let starts: Cands = if !whole_query {
-                vec![RoaringBitmap::new(); nseg]
-            } else {
-                per_segment(nseg, total >= PARALLEL_MIN_DOCS, |s| -> Result<RoaringBitmap> {
+            let mut starts: Cands = vec![RoaringBitmap::new(); nseg];
+            if whole_query {
+                let parts = pieces(&cands, total >= PARALLEL_MIN_DOCS);
+                let found = per_piece(parts.len(), total >= PARALLEL_MIN_DOCS, |t| -> Result<RoaringBitmap> {
+                    let s = parts[t].0;
                     let seg = &ctx.st.segs[s].seg;
-                    let mut want: Vec<u32> = cands[s].iter().collect();
+                    let mut want: Vec<u32> = parts[t].1.iter().collect();
                     for (i, w) in ctx.words.iter().enumerate() {
                         let Some(off) = w[s].exact_term.filter(|_| !want.is_empty()) else {
                             return Ok(RoaringBitmap::new());
@@ -849,8 +965,11 @@ fn rank(ctx: &Ctx, rules: &[Rule], cands: Cands, k: usize, out: &mut Vec<(usize,
                         want.retain(|_| *keep.next().unwrap());
                     }
                     Ok(want.into_iter().collect())
-                })?
-            };
+                })?;
+                for ((s, _), docs) in parts.iter().zip(found) {
+                    starts[*s] |= docs;
+                }
+            }
             prof(2, t_prof);
             for at_start in [true, false] {
                 // Then, by how many words are present exactly as typed.
@@ -1167,29 +1286,54 @@ pub fn search(st: &State, q: &SearchQuery) -> Result<Value> {
     let nseg = st.segs.len();
     let heavy = !phrases.is_empty() || words.len() > 1;
     let total_docs: u64 = st.segs.iter().map(|s| s.seg.doc_count as u64).sum();
-    let stage = per_segment(nseg, heavy && count(&cands) >= PARALLEL_MIN_DOCS, |s| -> Result<(RoaringBitmap, Vec<WordHits>)> {
-        let seg = &st.segs[s].seg;
-        let limit = derivation_limit(seg.doc_count as u64, total_docs);
-        let mut cand = cands[s].clone();
-        for phrase in &phrases {
-            if !cand.is_empty() {
-                cand = phrase_docs(seg, phrase, &cand, allowed.as_ref())?;
+    let spreading = count(&cands) >= PARALLEL_MIN_DOCS;
+    if !phrases.is_empty() {
+        let parts = pieces(&cands, spreading);
+        let kept = per_piece(parts.len(), spreading, |t| -> Result<RoaringBitmap> {
+            let seg = &st.segs[parts[t].0].seg;
+            let mut cand = Cow::Borrowed(&*parts[t].1);
+            for phrase in &phrases {
+                if !cand.is_empty() {
+                    cand = Cow::Owned(phrase_docs(seg, phrase, &cand, allowed.as_ref())?);
+                }
             }
+            Ok(cand.into_owned())
+        })?;
+        let mut left: Cands = vec![RoaringBitmap::new(); nseg];
+        for ((s, _), docs) in parts.iter().zip(kept) {
+            left[*s] |= docs;
         }
-        let mut found = Vec::with_capacity(words.len());
-        for (w, lev) in words.iter().zip(&levs) {
-            found.push(if cand.is_empty() { WordHits::default() } else { word_hits(seg, w, lev.as_ref(), settings, allowed.as_ref(), limit)? });
-        }
-        Ok((cand, found))
-    })?;
+        drop(parts);
+        cands = left;
+    }
     let t_phrase = started.elapsed();
+    // First the terms each word follows in each segment that still has
+    // candidates, then their postings, a run of terms at a time.
+    let pairs: Vec<(usize, usize)> = (0..nseg).filter(|s| !cands[*s].is_empty()).flat_map(|s| (0..words.len()).map(move |w| (s, w))).collect();
+    let walks = words.iter().any(|w| w.prefix || w.max_typo > 0);
+    let derived = per_piece(pairs.len(), spreading && (heavy || walks), |t| -> Result<Derived> {
+        let (s, w) = pairs[t];
+        let seg = &st.segs[s].seg;
+        Ok(derive(seg, &words[w], levs[w].as_ref(), settings, derivation_limit(seg.doc_count as u64, total_docs)))
+    })?;
+    let followed: usize = derived.iter().map(|d| d.terms.len()).sum();
+    let per = followed.div_ceil(spread()).max(TERMS_PER_PIECE);
+    let runs: Vec<(usize, &[(u64, usize)])> = derived.iter().enumerate().flat_map(|(t, d)| d.terms.chunks(per).map(move |run| (t, run))).collect();
+    let read = per_piece(runs.len(), spreading && (heavy || followed >= 2 * TERMS_PER_PIECE), |r| -> Result<WordHits> {
+        let (t, run) = runs[r];
+        WordHits::read(&st.segs[pairs[t].0].seg, derived[t].exact_term, run, allowed.as_ref())
+    })?;
     // hits[word][segment]
-    let mut hits: Vec<Vec<WordHits>> = words.iter().map(|_| Vec::with_capacity(nseg)).collect();
-    for (s, (cand, found)) in stage.into_iter().enumerate() {
-        cands[s] = cand;
-        for (w, h) in found.into_iter().enumerate() {
-            hits[w].push(h);
-        }
+    let mut hits: Vec<Vec<WordHits>> = words.iter().map(|_| (0..nseg).map(|_| WordHits::default()).collect()).collect();
+    for (&(s, w), d) in pairs.iter().zip(&derived) {
+        hits[w][s].exact_term = d.exact_term;
+    }
+    for ((t, _), part) in runs.iter().zip(read) {
+        let (s, w) = pairs[*t];
+        hits[w][s].absorb(part);
+    }
+    for h in hits.iter_mut().flatten() {
+        h.finish();
     }
     let match_all = q.matching_strategy.as_deref() == Some("all");
     if !words.is_empty() {
@@ -1339,5 +1483,30 @@ mod tests {
         assert_eq!(derivation_limit(10, 1_000_000), MAX_DERIVATIONS);
         assert_eq!(derivation_limit(900_000, 1_000_000), 2160);
         assert_eq!(derivation_limit(0, 0), MAX_DERIVATIONS);
+    }
+
+    #[test]
+    fn candidates_are_cut_into_runs_that_cover_them_once() {
+        let large: RoaringBitmap = (0..200_000u32).filter(|d| d % 3 != 1).chain(4_000_000_000..4_000_000_500).collect();
+        let small: RoaringBitmap = (10..40u32).collect();
+        let cands = vec![large.clone(), RoaringBitmap::new(), small.clone()];
+        // On one thread every segment that has candidates is one piece.
+        let whole = cut(&cands, 1);
+        assert_eq!(whole.iter().map(|(s, p)| (*s, p.len())).collect::<Vec<_>>(), [(0, large.len()), (2, small.len())]);
+        // On eight, the large segment is cut into even runs of documents in
+        // ascending order and the small one is left alone.
+        let parts = cut(&cands, 8);
+        assert_eq!(parts.last().map(|(s, p)| (*s, p.as_ref())), Some((2, &small)));
+        let runs: Vec<&RoaringBitmap> = parts.iter().filter(|(s, _)| *s == 0).map(|(_, p)| p.as_ref()).collect();
+        assert_eq!(runs.len(), 8);
+        let mut joined = RoaringBitmap::new();
+        for run in &runs {
+            assert!(run.len().abs_diff(large.len() / 8) <= 1, "{} documents", run.len());
+            assert!(joined.max() < run.min());
+            joined |= *run;
+        }
+        assert_eq!(joined, large);
+        // Too few candidates to be worth a second thread.
+        assert_eq!(cut(&vec![small.clone()], 8).len(), 1);
     }
 }

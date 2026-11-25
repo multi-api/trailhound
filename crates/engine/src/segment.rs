@@ -1607,6 +1607,53 @@ pub struct Segment {
     deleter: Deleter,
 }
 
+/// Steps over the positions of `docs` documents starting at `at`, and says
+/// where the next document's begin. A number's first byte says in its low
+/// bit whether the document has another one, and a byte is a first byte when
+/// the one before it does not carry on, so the documents that end in eight
+/// bytes are counted at once.
+fn skip_positions(buf: &[u8], mut at: usize, mut docs: u64) -> Result<usize> {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    let truncated = || Error::corrupt("truncated positions");
+    // Whether `at` is in the middle of a number.
+    let mut inside = false;
+    while docs > 0 {
+        if let Some(chunk) = buf.get(at..at + 8) {
+            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            let carried = ((word & HIGH) << 8) | if inside { 0x80 } else { 0 };
+            let ended = (!carried & ((!word & LOW) << 7) & HIGH).count_ones() as u64;
+            // Strictly fewer: the bytes after the last end belong to a
+            // document that is stepped over too.
+            if ended < docs {
+                docs -= ended;
+                at += 8;
+                inside = word >> 63 == 1;
+                continue;
+            }
+        }
+        // The rest of a number whose first byte was already counted.
+        while inside {
+            inside = *buf.get(at).ok_or_else(truncated)? & 0x80 != 0;
+            at += 1;
+        }
+        loop {
+            let first = *buf.get(at).ok_or_else(truncated)?;
+            at += 1;
+            let mut byte = first;
+            while byte & 0x80 != 0 {
+                byte = *buf.get(at).ok_or_else(truncated)?;
+                at += 1;
+            }
+            if first & 1 == 0 {
+                break;
+            }
+        }
+        docs -= 1;
+    }
+    Ok(at)
+}
+
 impl Segment {
     pub fn open(path: &Path, id: u64) -> Result<Segment> {
         let file = File::open(path)?;
@@ -1816,28 +1863,6 @@ impl Segment {
         Ok(out)
     }
 
-    /// Visit the token positions of a posting list for the documents in
-    /// `want`. `docs` must be the document set returned with `pos_off`.
-    pub fn for_each_position(&self, pos_off: u64, docs: &RoaringBitmap, want: &RoaringBitmap, mut f: impl FnMut(u32, u32)) -> Result<()> {
-        let buf = self.positions.as_ref();
-        let mut at = pos_off as usize;
-        for doc in docs {
-            let wanted = want.contains(doc);
-            let mut pos = 0u32;
-            loop {
-                let v = read_varint(buf, &mut at)?;
-                pos = pos.wrapping_add((v >> 1) as u32);
-                if wanted {
-                    f(doc, pos);
-                }
-                if v & 1 == 0 {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Visit the still-encoded positions of each document of a posting list.
     fn raw_positions(&self, pos_off: u64, docs: &RoaringBitmap, mut f: impl FnMut(u32, &[u8])) -> Result<()> {
         let buf = self.positions.as_ref();
@@ -1856,39 +1881,35 @@ impl Segment {
     /// after the last wanted one.
     pub fn scan_positions(&self, pos_off: u64, docs: &RoaringBitmap, want: &[u32], mut f: impl FnMut(usize, u32)) -> Result<()> {
         let buf = self.positions.as_ref();
-        let truncated = || Error::corrupt("truncated positions");
+        let Some(&first) = want.first() else {
+            return Ok(());
+        };
         let mut at = pos_off as usize;
         let mut w = 0usize;
-        for doc in docs {
+        // Documents of the list met since the last wanted one: their
+        // positions are stepped over together.
+        let mut unwanted = docs.rank(first) - docs.contains(first) as u64;
+        let mut iter = docs.iter();
+        iter.advance_to(first);
+        for doc in iter {
             while w < want.len() && want[w] < doc {
                 w += 1;
             }
             if w == want.len() {
                 break;
             }
-            if want[w] == doc {
-                let mut pos = 0u32;
-                loop {
-                    let v = read_varint(buf, &mut at)?;
-                    pos = pos.wrapping_add((v >> 1) as u32);
-                    f(w, pos);
-                    if v & 1 == 0 {
-                        break;
-                    }
-                }
-            } else {
-                // The low bit of a varint's first byte says whether another follows.
-                loop {
-                    let first = *buf.get(at).ok_or_else(truncated)?;
-                    at += 1;
-                    let mut byte = first;
-                    while byte & 0x80 != 0 {
-                        byte = *buf.get(at).ok_or_else(truncated)?;
-                        at += 1;
-                    }
-                    if first & 1 == 0 {
-                        break;
-                    }
+            if want[w] != doc {
+                unwanted += 1;
+                continue;
+            }
+            at = skip_positions(buf, at, std::mem::take(&mut unwanted))?;
+            let mut pos = 0u32;
+            loop {
+                let v = read_varint(buf, &mut at)?;
+                pos = pos.wrapping_add((v >> 1) as u32);
+                f(w, pos);
+                if v & 1 == 0 {
+                    break;
                 }
             }
         }
@@ -2084,5 +2105,44 @@ impl Segment {
             }
         }
         SortKey::Missing
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::write_varint;
+
+    #[test]
+    fn positions_are_stepped_over_as_they_are_read() {
+        // Documents with one to five positions, some of them needing two or
+        // three bytes, written the way a segment stores them.
+        let mut buf = Vec::new();
+        let mut starts = vec![0usize];
+        let mut seed = 7u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        for _ in 0..500 {
+            let count = 1 + next() % 5;
+            for i in 0..count {
+                let delta = match next() % 4 {
+                    0 => next() % 40_000,
+                    1 => next() % 300,
+                    _ => next() % 60,
+                };
+                write_varint(&mut buf, (delta << 1) | (i + 1 < count) as u64);
+            }
+            starts.push(buf.len());
+        }
+        for from in [0, 1, 2, 7, 63, 250, 499] {
+            for docs in [0, 1, 2, 3, 8, 9, 100, 500] {
+                if from + docs <= 500 {
+                    assert_eq!(skip_positions(&buf, starts[from], docs as u64).unwrap(), starts[from + docs], "from {from}, {docs} documents");
+                }
+            }
+        }
+        assert!(skip_positions(&buf, starts[499], 2).is_err());
     }
 }
