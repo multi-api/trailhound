@@ -243,11 +243,10 @@ impl TaskStore {
         self.finished_bytes += task.size;
         self.tasks.insert(task.uid, task);
         self.prune();
-        if self.log_bytes > self.compact_at {
-            if let Err(e) = self.compact() {
+        if self.log_bytes > self.compact_at
+            && let Err(e) = self.compact() {
                 eprintln!("[trailhound] cannot rewrite {}: {e}", self.path.display());
             }
-        }
     }
 
     /// Forget the oldest finished tasks beyond the count and size kept.
@@ -374,11 +373,10 @@ impl Tenant {
 
     fn create_index(&self, uid: &str, primary_key: Option<String>, task: u64) -> Result<Arc<Index>, ApiError> {
         let mut indexes = self.indexes.write().unwrap();
-        if let Some(max) = self.meta.read().unwrap().quotas.max_indexes {
-            if indexes.len() as u64 >= max {
+        if let Some(max) = self.meta.read().unwrap().quotas.max_indexes
+            && indexes.len() as u64 >= max {
                 return Err(ApiError::new(StatusCode::FORBIDDEN, "quota_exceeded", format!("This plan allows at most {max} indexes.")));
             }
-        }
         // A fresh directory per creation: files of a deleted index with the
         // same uid may still be held open by a search in flight.
         let dir = self.dir.join("indexes").join(format!("{uid}-{}", &Uuid::new_v4().simple().to_string()[..8]));
@@ -475,16 +473,14 @@ impl Tenant {
             return Ok(());
         }
         let usage = self.usage();
-        if let Some(max) = quotas.max_documents {
-            if usage["documents"].as_u64().unwrap_or(0) + incoming > max {
+        if let Some(max) = quotas.max_documents
+            && usage["documents"].as_u64().unwrap_or(0) + incoming > max {
                 return Err(ApiError::new(StatusCode::FORBIDDEN, "quota_exceeded", format!("This plan allows at most {max} documents.")));
             }
-        }
-        if let Some(max) = quotas.max_storage_bytes {
-            if usage["storageBytes"].as_u64().unwrap_or(0).saturating_add(incoming_bytes) > max {
+        if let Some(max) = quotas.max_storage_bytes
+            && usage["storageBytes"].as_u64().unwrap_or(0).saturating_add(incoming_bytes) > max {
                 return Err(ApiError::new(StatusCode::FORBIDDEN, "quota_exceeded", format!("This plan allows at most {max} bytes of storage.")));
             }
-        }
         Ok(())
     }
 

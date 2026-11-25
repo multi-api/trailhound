@@ -768,12 +768,11 @@ impl SegmentBuilder {
             let col = self.sort.entry(fid).or_default();
             match v {
                 Value::Number(n) => {
-                    if let Some(f) = n.as_f64() {
-                        if col.nums.last().map(|l| l.0) != Some(docid) {
+                    if let Some(f) = n.as_f64()
+                        && col.nums.last().map(|l| l.0) != Some(docid) {
                             col.nums.push((docid, f));
                             self.mem += 16;
                         }
-                    }
                 }
                 Value::String(s) if col.strs.last().map(|l| l.0) != Some(docid) => {
                     let norm = normalize_facet(s);
@@ -1704,11 +1703,10 @@ impl Segment {
     }
 
     fn block(&self, i: usize) -> Result<Arc<Vec<u8>>> {
-        if let Some((cached, data)) = self.cache.lock().unwrap().as_ref() {
-            if *cached == i {
+        if let Some((cached, data)) = self.cache.lock().unwrap().as_ref()
+            && *cached == i {
                 return Ok(data.clone());
             }
-        }
         let (off, len, _, crc) = self.block_entry(i);
         let docs = self.docs.as_ref();
         let comp = docs.get(off..off + len).ok_or_else(|| Error::corrupt("document block out of bounds"))?;

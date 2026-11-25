@@ -62,11 +62,10 @@ impl FromRequestParts<Arc<Platform>> for Auth {
         if tenant.meta.read().unwrap().suspended {
             return Err(ApiError::new(StatusCode::FORBIDDEN, "tenant_suspended", "This account is suspended."));
         }
-        if let Some(expires) = key.as_ref().and_then(|k| k.expires_at.as_ref()) {
-            if expires.as_str() < now_rfc3339().as_str() {
+        if let Some(expires) = key.as_ref().and_then(|k| k.expires_at.as_ref())
+            && expires.as_str() < now_rfc3339().as_str() {
                 return Err(invalid());
             }
-        }
         Ok(Auth { tenant, key })
     }
 }
