@@ -53,13 +53,13 @@ fn index_threads() -> usize {
 }
 /// Merging stops growing a segment past this many documents.
 const MAX_MERGED_DOCS: u64 = 1_000_000;
-/// Merges at least this large are worth the dense compression level.
-const DENSE_MERGE_DOCS: u64 = 400_000;
 const MERGE_TRIGGER: usize = 8;
 const MERGE_WIDTH: usize = 5;
-/// zstd level for fresh segments (fast) and for merged segments (dense).
-const LEVEL_FRESH: i32 = 6;
-const LEVEL_MERGED: i32 = 19;
+/// zstd level of the document blocks. They are 16 KB each, too small for the
+/// highest levels to pay: on Wikipedia text, level 19 took eleven times as
+/// long as this one to make the documents 2% smaller, and compressing them
+/// again in every large merge was most of the time spent indexing.
+const LEVEL: i32 = 6;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SegMeta {
@@ -429,7 +429,7 @@ impl Index {
             for _ in 0..parts {
                 // No buffering: a thread takes its next batch when it is ready for it.
                 let (tx, rx) = mpsc::sync_channel::<Job>(0);
-                let writer = Writer::shared(&self.dir, schema.clone(), LEVEL_FRESH, next_seg.clone(), flush_mem);
+                let writer = Writer::shared(&self.dir, schema.clone(), LEVEL, next_seg.clone(), flush_mem);
                 let st = &st;
                 handles.push(scope.spawn(move || self.index_part(st, rx, writer, partial)));
                 txs.push(tx);
@@ -635,7 +635,7 @@ impl Index {
     /// Re-index the live documents of the chosen segments into new ones.
     fn rewrite(&self, st: &State, which: &[usize], manifest: &mut Manifest) -> Result<Vec<SegHandle>> {
         let pk = manifest.primary_key.clone().ok_or_else(|| Error::corrupt("documents without a primary key"))?;
-        let mut writer = Writer::new(&self.dir, manifest, LEVEL_MERGED);
+        let mut writer = Writer::new(&self.dir, manifest, LEVEL);
         for &i in which {
             let handle = &st.segs[i];
             handle.seg.for_each_doc(|docid, bytes| {
@@ -651,7 +651,7 @@ impl Index {
     }
 
     /// Keep the number of segments bounded by merging the smallest ones.
-    /// Merging also drops deleted documents and recompresses at a higher level.
+    /// Merging also drops deleted documents.
     fn maybe_merge(&self, task: u64) -> Result<()> {
         loop {
             let st = self.snapshot();
@@ -676,8 +676,7 @@ impl Index {
                 let id = manifest.next_seg;
                 manifest.next_seg += 1;
                 let inputs: Vec<MergeInput> = picked.iter().map(|i| MergeInput { seg: &st.segs[*i].seg, deleted: &st.segs[*i].deleted }).collect();
-                let level = if total >= DENSE_MERGE_DOCS { LEVEL_MERGED } else { LEVEL_FRESH };
-                segment::merge(&inputs, &st.schema, &seg_path(&self.dir, id), level, total < DENSE_MERGE_DOCS)?;
+                segment::merge(&inputs, &st.schema, &seg_path(&self.dir, id), LEVEL)?;
                 segs.push(SegHandle { seg: Arc::new(Segment::open(&seg_path(&self.dir, id), id)?), deleted: RoaringBitmap::new() });
             }
             self.commit(manifest, segs, task)?;
