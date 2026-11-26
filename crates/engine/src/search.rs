@@ -481,7 +481,10 @@ const SPREAD: usize = 8;
 
 fn spread() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(SPREAD))
+    *N.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        std::env::var("TRAILHOUND_SEARCH_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(SPREAD).min(cores)
+    })
 }
 
 /// The candidates cut into pieces of work: one per segment, or, when the
